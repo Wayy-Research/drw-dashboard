@@ -18,13 +18,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
-from typing import Any
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
+import asyncpg
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from starlette.responses import StreamingResponse
+
+log = logging.getLogger("drw_dashboard")
 
 BASE_URL = "https://games.drw.com/api/games/trading-simulator/160"
 TOKEN = (
@@ -70,6 +76,49 @@ state: dict[str, Any] = {
     "trades": {}, "report": {}, "last_update": 0.0, "error": None,
 }
 
+# ---------------------------------------------------------------------------
+# Read-side DB pool (lazy, for history API endpoints)
+# ---------------------------------------------------------------------------
+_DB_HOST = "100.96.150.42"
+_DB_PORT = 5432
+_DB_USER = "wayy"
+_DB_NAME = "wayydb"
+_read_pool: asyncpg.Pool | None = None
+
+
+def _get_db_password() -> str:
+    """Resolve DB password from env or config file."""
+    import os
+    pw = os.environ.get("WAYY_DB_PASS")
+    if pw:
+        return pw
+    config_path = Path.home() / ".config" / "wayy" / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        pw = cfg.get("db_pass")
+        if pw:
+            return pw
+    raise RuntimeError("No DB password found.")
+
+
+async def _get_read_pool() -> asyncpg.Pool:
+    """Return (and lazily create) a read-only connection pool."""
+    global _read_pool
+    if _read_pool is None:
+        _read_pool = await asyncpg.create_pool(
+            host=_DB_HOST,
+            port=_DB_PORT,
+            user=_DB_USER,
+            password=_get_db_password(),
+            database=_DB_NAME,
+            min_size=1,
+            max_size=5,
+        )
+        log.info("Read pool created (%s:%s/%s)", _DB_HOST, _DB_PORT, _DB_NAME)
+    return _read_pool
+
+
 app = FastAPI(title="DRW Market Madness Dashboard")
 
 # DB logging flag — set to False to disable
@@ -85,7 +134,7 @@ async def _maybe_log_to_db() -> None:
     try:
         from mania.drw.db_logger import (
             init_db, log_trades, log_orderbook_snapshot,
-            log_positions, log_pnl,
+            log_positions, log_pnl, log_leaderboard,
         )
         if not _db_initialized:
             await init_db()
@@ -116,11 +165,47 @@ async def _maybe_log_to_db() -> None:
             mid = (bb + ba) / 2 if bb and ba else bb or ba or fv
             total_val += mid * qty
 
+        # Build leaderboard estimates from trade data
+        lb_entries: list[dict[str, Any]] = []
+        participants: dict[int, dict[str, Any]] = {}
+        for sym, tlist in trades.items():
+            for t in tlist:
+                maker_id = t.get("maker_id", 0)
+                taker_id = t.get("taker_id", 0)
+                qty = t.get("quantity", 0)
+                px = t.get("price", 0)
+                for uid in (maker_id, taker_id):
+                    if uid not in participants:
+                        participants[uid] = {
+                            "trades": 0, "positions": {}, "cash_flow": 0.0,
+                        }
+                participants[maker_id]["trades"] += 1
+                participants[maker_id]["positions"][sym] = (
+                    participants[maker_id]["positions"].get(sym, 0) + qty
+                )
+                participants[maker_id]["cash_flow"] -= px * qty
+                participants[taker_id]["trades"] += 1
+                participants[taker_id]["positions"][sym] = (
+                    participants[taker_id]["positions"].get(sym, 0) - qty
+                )
+                participants[taker_id]["cash_flow"] += px * qty
+
+        for uid, data in participants.items():
+            pos_val = sum(
+                FAIR_VALUES.get(s, 0) * q for s, q in data["positions"].items()
+            )
+            lb_entries.append({
+                "user_id": uid,
+                "estimated_pnl": round(data["cash_flow"] + pos_val, 2),
+                "n_trades": data["trades"],
+            })
+
         await asyncio.gather(
             log_trades(trades),
             log_orderbook_snapshot(books),
             log_positions(account, FAIR_VALUES, books),
             log_pnl(cash, cash + total_val, report.get("market_pl", 0), n_pos, n_orders),
+            log_leaderboard(lb_entries),
             return_exceptions=True,
         )
     except Exception:
@@ -446,6 +531,264 @@ async def api_book(symbol: str) -> dict:
     }
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# History API endpoints (read from wayydb via asyncpg)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@app.get("/api/history/pnl")
+async def api_history_pnl(
+    hours: float = Query(24, ge=0.1, le=168, description="Lookback hours"),
+    interval: str = Query("5m", regex="^(1m|5m|15m|1h)$", description="Sampling interval"),
+) -> dict[str, Any]:
+    """Return NAV time series for charting, downsampled to at most 500 points."""
+    try:
+        pool = await _get_read_pool()
+    except Exception:
+        return {"times": [], "nav": [], "cash": [], "market_pl": []}
+
+    # Map interval string to a date_trunc bucket or minute divisor
+    interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
+    bucket_min = interval_minutes.get(interval, 5)
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    date_trunc('hour', timestamp)
+                        + (EXTRACT(minute FROM timestamp)::int / $1) * ($1 || ' minutes')::interval
+                        AS bucket,
+                    AVG(nav) AS nav,
+                    AVG(cash) AS cash,
+                    AVG(market_pl) AS market_pl
+                FROM drw_pnl_snapshots
+                WHERE timestamp >= NOW() - ($2 || ' hours')::interval
+                GROUP BY bucket
+                ORDER BY bucket
+                LIMIT 500
+                """,
+                bucket_min,
+                str(hours),
+            )
+        times = [r["bucket"].isoformat() for r in rows]
+        nav = [round(float(r["nav"]), 2) if r["nav"] is not None else None for r in rows]
+        cash = [round(float(r["cash"]), 2) if r["cash"] is not None else None for r in rows]
+        market_pl = [round(float(r["market_pl"]), 2) if r["market_pl"] is not None else None for r in rows]
+        return {"times": times, "nav": nav, "cash": cash, "market_pl": market_pl}
+    except Exception as exc:
+        log.warning("history/pnl query failed: %s", exc)
+        return {"times": [], "nav": [], "cash": [], "market_pl": []}
+
+
+@app.get("/api/history/trades/{symbol}")
+async def api_history_trades(
+    symbol: str,
+    hours: float = Query(24, ge=0.1, le=168, description="Lookback hours"),
+    limit: int = Query(200, ge=1, le=1000, description="Max rows"),
+) -> dict[str, Any]:
+    """Trade history for one contract."""
+    try:
+        pool = await _get_read_pool()
+    except Exception:
+        return {"trades": []}
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT timestamp, price, quantity, maker_id, taker_id
+                FROM drw_trades
+                WHERE symbol = $1
+                  AND timestamp >= NOW() - ($2 || ' hours')::interval
+                ORDER BY timestamp DESC
+                LIMIT $3
+                """,
+                symbol,
+                str(hours),
+                limit,
+            )
+        trades = [
+            {
+                "ts": r["timestamp"].isoformat(),
+                "price": round(float(r["price"]), 2),
+                "qty": int(r["quantity"]),
+                "is_ours": r["maker_id"] == OUR_USER_ID or r["taker_id"] == OUR_USER_ID,
+            }
+            for r in rows
+        ]
+        return {"trades": trades}
+    except Exception as exc:
+        log.warning("history/trades query failed: %s", exc)
+        return {"trades": []}
+
+
+@app.get("/api/history/fills")
+async def api_history_fills(
+    hours: float = Query(24, ge=0.1, le=168, description="Lookback hours"),
+) -> dict[str, Any]:
+    """Our fill history."""
+    try:
+        pool = await _get_read_pool()
+    except Exception:
+        return {"fills": []}
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT timestamp, symbol, side, price, quantity, edge
+                FROM drw_fills
+                WHERE timestamp >= NOW() - ($1 || ' hours')::interval
+                ORDER BY timestamp DESC
+                """,
+                str(hours),
+            )
+        fills = [
+            {
+                "ts": r["timestamp"].isoformat(),
+                "symbol": r["symbol"],
+                "side": r["side"],
+                "price": round(float(r["price"]), 2),
+                "qty": int(r["quantity"]),
+                "edge": round(float(r["edge"]), 4) if r["edge"] is not None else None,
+            }
+            for r in rows
+        ]
+        return {"fills": fills}
+    except Exception as exc:
+        log.warning("history/fills query failed: %s", exc)
+        return {"fills": []}
+
+
+@app.get("/api/history/positions")
+async def api_history_positions(
+    hours: float = Query(24, ge=0.1, le=168, description="Lookback hours"),
+    symbol: Optional[str] = Query(None, description="Filter to one contract"),
+) -> dict[str, Any]:
+    """Position history for charting, sampled to ~200 points."""
+    try:
+        pool = await _get_read_pool()
+    except Exception:
+        return {"snapshots": []}
+
+    try:
+        # First get total row count to compute sampling modulo
+        async with pool.acquire() as conn:
+            # Use ROW_NUMBER modulo sampling to get ~200 distinct timestamps
+            if symbol is not None:
+                rows = await conn.fetch(
+                    """
+                    WITH numbered AS (
+                        SELECT timestamp, symbol, position,
+                               ROW_NUMBER() OVER (ORDER BY timestamp) AS rn,
+                               COUNT(*) OVER () AS total
+                        FROM drw_positions
+                        WHERE timestamp >= NOW() - ($1 || ' hours')::interval
+                          AND symbol = $2
+                    )
+                    SELECT timestamp, symbol, position
+                    FROM numbered
+                    WHERE rn % GREATEST(total / 200, 1) = 0
+                    ORDER BY timestamp
+                    """,
+                    str(hours),
+                    symbol,
+                )
+            else:
+                # Get distinct timestamp buckets, then pivot positions
+                rows = await conn.fetch(
+                    """
+                    WITH ts_buckets AS (
+                        SELECT DISTINCT timestamp
+                        FROM drw_positions
+                        WHERE timestamp >= NOW() - ($1 || ' hours')::interval
+                        ORDER BY timestamp
+                    ),
+                    numbered AS (
+                        SELECT timestamp,
+                               ROW_NUMBER() OVER (ORDER BY timestamp) AS rn,
+                               COUNT(*) OVER () AS total
+                        FROM ts_buckets
+                    ),
+                    sampled_ts AS (
+                        SELECT timestamp
+                        FROM numbered
+                        WHERE rn % GREATEST(total / 200, 1) = 0
+                    )
+                    SELECT p.timestamp, p.symbol, p.position
+                    FROM drw_positions p
+                    INNER JOIN sampled_ts s ON p.timestamp = s.timestamp
+                    ORDER BY p.timestamp, p.symbol
+                    """,
+                    str(hours),
+                )
+
+        # Group by timestamp -> {symbol: qty}
+        snapshots_map: dict[str, dict[str, int]] = {}
+        for r in rows:
+            ts_key = r["timestamp"].isoformat()
+            if ts_key not in snapshots_map:
+                snapshots_map[ts_key] = {}
+            snapshots_map[ts_key][r["symbol"]] = int(r["position"])
+
+        snapshots = [
+            {"ts": ts, "positions": pos}
+            for ts, pos in snapshots_map.items()
+        ]
+        return {"snapshots": snapshots}
+    except Exception as exc:
+        log.warning("history/positions query failed: %s", exc)
+        return {"snapshots": []}
+
+
+@app.get("/api/history/spreads")
+async def api_history_spreads(
+    symbol: str = Query(..., description="Contract symbol (required)"),
+    hours: float = Query(6, ge=0.1, le=168, description="Lookback hours"),
+) -> dict[str, Any]:
+    """Spread history per contract."""
+    try:
+        pool = await _get_read_pool()
+    except Exception:
+        return {"data": []}
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH numbered AS (
+                    SELECT timestamp, best_bid, best_ask, mid, spread,
+                           ROW_NUMBER() OVER (ORDER BY timestamp) AS rn,
+                           COUNT(*) OVER () AS total
+                    FROM drw_orderbook_snapshots
+                    WHERE symbol = $1
+                      AND timestamp >= NOW() - ($2 || ' hours')::interval
+                )
+                SELECT timestamp, best_bid, best_ask, mid, spread
+                FROM numbered
+                WHERE rn % GREATEST(total / 500, 1) = 0
+                ORDER BY timestamp
+                """,
+                symbol,
+                str(hours),
+            )
+        data = [
+            {
+                "ts": r["timestamp"].isoformat(),
+                "bid": round(float(r["best_bid"]), 2) if r["best_bid"] is not None else None,
+                "ask": round(float(r["best_ask"]), 2) if r["best_ask"] is not None else None,
+                "mid": round(float(r["mid"]), 4) if r["mid"] is not None else None,
+                "spread": round(float(r["spread"]), 4) if r["spread"] is not None else None,
+            }
+            for r in rows
+        ]
+        return {"data": data}
+    except Exception as exc:
+        log.warning("history/spreads query failed: %s", exc)
+        return {"data": []}
+
+
 @app.get("/stream")
 async def stream() -> StreamingResponse:
     """SSE endpoint -- pushes snapshots every 2 seconds."""
@@ -469,480 +812,490 @@ async def dashboard() -> str:
 HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DRW Market Madness -- Wayy Research</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DRW Market Madness | Wayy Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
+:root{--bg:#0a0e14;--card:#111820;--border:#1b2430;--border2:#253040;--text:#c9d1d9;--text2:#8b949e;--text3:#545d68;--green:#00d4aa;--red:#ff4757;--blue:#3b82f6;--yellow:#e3b341;--font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,monospace;background:#0d1117;color:#c9d1d9;padding:16px 24px;min-height:100vh}
-h1{font-size:1.4rem;font-weight:600;color:#e6edf3}
-.sub{font-size:.75rem;color:#484f58;margin-bottom:16px}
-.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#00e676;margin-right:6px;animation:pulse 1.5s infinite}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--card)}
+.header-left{display:flex;align-items:center;gap:12px}
+.logo{font-size:1rem;font-weight:700;color:#fff;letter-spacing:-0.02em}
+.logo span{color:var(--blue)}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.header-right{display:flex;align-items:center;gap:16px;font-size:.75rem;color:var(--text2)}
+.regime-badge{padding:3px 10px;border-radius:4px;font-size:.7rem;font-weight:600;letter-spacing:.03em}
+.regime-badge.mr{background:#00d4aa18;color:var(--green);border:1px solid #00d4aa33}
+.regime-badge.tr{background:#e3b34118;color:var(--yellow);border:1px solid #e3b34133}
 
-/* NAV chart container */
-.nav-chart-wrap{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:16px}
-.nav-chart-wrap .chart-title{font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:6px}
+/* KPI Cards */
+.kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;padding:12px 20px}
+.kpi{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;backdrop-filter:blur(8px)}
+.kpi .label{font-size:.65rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin-bottom:4px}
+.kpi .value{font-size:1.2rem;font-weight:700;font-family:var(--mono);transition:color .3s}
+.kpi .delta{font-size:.7rem;font-family:var(--mono);margin-top:2px}
 
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-.card .l{font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:2px}
-.card .v{font-size:1.3rem;font-weight:700;font-family:'SF Mono','Fira Code',monospace}
-.tabs{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
-.tab{padding:6px 16px;border-radius:6px;font-size:.8rem;cursor:pointer;border:1px solid #30363d;background:#161b22;color:#8b949e;transition:all .15s}
-.tab:hover{background:#1c2128;color:#c9d1d9}
-.tab.active{background:#1f6feb;color:#fff;border-color:#1f6feb}
-.panel{display:none}.panel.active{display:block}
-table{width:100%;border-collapse:collapse;font-size:.8rem}
-th{text-align:left;padding:6px 10px;border-bottom:2px solid #30363d;color:#8b949e;font-weight:600;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;position:sticky;top:0;background:#0d1117;z-index:1}
-td{padding:5px 10px;border-bottom:1px solid #21262d}
-tr:hover{background:#1c2128}
-.n{text-align:right;font-family:'SF Mono','Fira Code',monospace}
+/* Main grid */
+.main-grid{display:grid;grid-template-columns:3fr 2fr;gap:0;padding:0 20px}
+.chart-area{min-width:0}
+.sidebar{min-width:0;border-left:1px solid var(--border);padding-left:16px;margin-left:16px}
+
+/* Card containers */
+.panel-card{background:var(--card);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden}
+.panel-card .card-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);font-weight:600}
+
+/* Tabs */
+.tabs{display:flex;gap:2px;padding:12px 20px 0;border-top:1px solid var(--border);margin-top:4px}
+.tab{padding:8px 18px;border-radius:6px 6px 0 0;font-size:.8rem;font-weight:500;cursor:pointer;border:1px solid transparent;background:transparent;color:var(--text3);transition:all .15s}
+.tab:hover{background:var(--card);color:var(--text)}
+.tab.active{background:var(--card);color:#fff;border-color:var(--border);border-bottom-color:var(--card)}
+.panel{display:none;background:var(--card);border:1px solid var(--border);border-top:none;border-radius:0 0 8px 8px;margin:0 20px 20px;max-height:420px;overflow-y:auto}
+.panel.active{display:block}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:.78rem}
+th{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border2);color:var(--text2);font-weight:600;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;position:sticky;top:0;background:var(--card);z-index:2}
+td{padding:6px 12px;border-bottom:1px solid var(--border)}
+tr:nth-child(even){background:#0d1219}
+tr:hover{background:#151d28}
+.n{text-align:right;font-family:var(--mono)}
 th.n{text-align:right}
-.g{color:#00e676}.r{color:#ff5252}.y{color:#e3b341}.d{color:#484f58}.b{color:#58a6ff}
-.ticker{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;margin-bottom:16px;max-height:180px;overflow-y:auto;font-family:'SF Mono',monospace;font-size:.75rem}
-.ticker-row{padding:3px 0;border-bottom:1px solid #21262d;display:flex;gap:12px}
-.ticker-row .sym{width:130px;font-weight:600}
-.ticker-row .ours{background:#1f6feb22;border-left:2px solid #1f6feb;padding-left:8px}
-.spread-bar{display:inline-block;height:4px;border-radius:2px;vertical-align:middle}
+.g{color:var(--green)}.r{color:var(--red)}.y{color:var(--yellow)}.d{color:var(--text3)}.b{color:var(--blue)}
 
-/* Clickable team names */
-.team-link{cursor:pointer;color:#58a6ff;text-decoration:none;border-bottom:1px dotted #58a6ff44}
-.team-link:hover{color:#79c0ff;border-bottom-color:#79c0ff}
+/* Links */
+.team-link{cursor:pointer;color:var(--blue);text-decoration:none;border-bottom:1px dotted rgba(59,130,246,.3);transition:all .15s}
+.team-link:hover{color:#60a5fa;border-bottom-color:#60a5fa}
 
-/* Order book modal */
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);z-index:100;justify-content:center;align-items:center}
+/* Leaderboard */
+.lb-us{background:rgba(59,130,246,.08) !important;border-left:3px solid var(--blue)}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.65rem;font-weight:600;letter-spacing:.03em}
+.badge-us{background:rgba(59,130,246,.15);color:var(--blue);border:1px solid rgba(59,130,246,.3)}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);backdrop-filter:blur(4px);z-index:100;justify-content:center;align-items:center}
 .modal-overlay.show{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:520px;max-width:95vw;max-height:85vh;overflow-y:auto;position:relative}
-.modal h2{font-size:1.1rem;color:#e6edf3;margin-bottom:4px}
-.modal .modal-sub{font-size:.75rem;color:#8b949e;margin-bottom:16px}
-.modal-close{position:absolute;top:12px;right:16px;background:none;border:none;color:#8b949e;font-size:1.2rem;cursor:pointer}
-.modal-close:hover{color:#e6edf3}
-.book-ladder{display:flex;gap:16px}
-.book-side{flex:1}
-.book-side h3{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;margin-bottom:8px;text-align:center}
-.book-row{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:.78rem;font-family:'SF Mono',monospace;position:relative}
-.book-row .price{width:60px;text-align:right}
-.book-row .qty{width:40px;text-align:right}
+.modal{background:var(--card);border:1px solid var(--border2);border-radius:12px;padding:24px;width:720px;max-width:95vw;max-height:90vh;overflow-y:auto;position:relative}
+.modal h2{font-size:1.1rem;font-weight:700;color:#fff;margin-bottom:4px}
+.modal-sub{font-size:.75rem;color:var(--text2);margin-bottom:16px}
+.modal-close{position:absolute;top:12px;right:16px;background:none;border:none;color:var(--text2);font-size:1.4rem;cursor:pointer;line-height:1}
+.modal-close:hover{color:#fff}
+.book-ladder{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:12px}
+.book-side h3{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin-bottom:8px;text-align:center}
+.book-row{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:.78rem;font-family:var(--mono)}
+.book-row .price{width:60px;text-align:right}.book-row .qty{width:40px;text-align:right}
 .book-bar{height:20px;border-radius:2px;min-width:2px;transition:width .3s}
-.bid-bar{background:#00e67633}
-.ask-bar{background:#ff525233}
-.book-fv{text-align:center;padding:8px 0;font-size:.8rem;color:#e3b341;border-top:1px solid #30363d;border-bottom:1px solid #30363d;margin:8px 0}
+.bid-bar{background:rgba(0,212,170,.15)}.ask-bar{background:rgba(255,71,87,.15)}
+.book-fv{text-align:center;padding:8px 0;font-size:.8rem;color:var(--yellow);border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:8px 0;font-family:var(--mono)}
+.sparkline-cell{width:90px;vertical-align:middle}
 
-/* Leaderboard highlight */
-.lb-us{background:#1f6feb18;border-left:3px solid #1f6feb}
-.lb-rank{width:40px;text-align:center;font-weight:700}
-
-/* Strategy badges */
-.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:600;letter-spacing:.03em}
-.badge-mm{background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44}
-.badge-mr{background:#00e67622;color:#00e676;border:1px solid #00e67644}
-.badge-tr{background:#e3b34122;color:#e3b341;border:1px solid #e3b34144}
-.badge-rw{background:#8b949e22;color:#8b949e;border:1px solid #8b949e44}
-
-/* Sparkline in table */
-.sparkline-cell{width:100px;vertical-align:middle}
+@media(max-width:900px){
+  .kpi-row{grid-template-columns:repeat(3,1fr)}
+  .main-grid{grid-template-columns:1fr}
+  .sidebar{border-left:none;padding-left:0;margin-left:0;margin-top:12px}
+}
+@media(max-width:600px){
+  .kpi-row{grid-template-columns:repeat(2,1fr)}
+  .header{flex-direction:column;gap:8px;align-items:flex-start}
+}
 </style>
 </head><body>
-<h1><span class="live-dot"></span>DRW Market Madness -- Wayy Research</h1>
-<div class="sub" id="sub">Connecting...</div>
 
-<!-- NAV Time Series Chart (lightweight-charts) -->
-<div class="nav-chart-wrap">
-  <div class="chart-title">NAV Time Series</div>
-  <div id="nav-chart" style="height:120px"></div>
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div class="live-dot"></div>
+    <div class="logo">DRW Market Madness <span>| Wayy Research</span></div>
+  </div>
+  <div class="header-right">
+    <span id="timestamp">Connecting...</span>
+    <span class="regime-badge mr" id="regime-badge"></span>
+  </div>
 </div>
 
-<div class="cards" id="cards"></div>
+<!-- KPI Cards -->
+<div class="kpi-row" id="kpi-row">
+  <div class="kpi"><div class="label">NAV</div><div class="value" id="kpi-nav">--</div><div class="delta d" id="kpi-nav-d"></div></div>
+  <div class="kpi"><div class="label">Cash</div><div class="value b" id="kpi-cash">--</div><div class="delta d" id="kpi-cash-d"></div></div>
+  <div class="kpi"><div class="label">Market P&L</div><div class="value" id="kpi-mpl">--</div><div class="delta d" id="kpi-mpl-d"></div></div>
+  <div class="kpi"><div class="label">Rank</div><div class="value" id="kpi-rank">--</div><div class="delta d" id="kpi-rank-d"></div></div>
+  <div class="kpi"><div class="label">Fills (M/T)</div><div class="value" id="kpi-fills">--</div><div class="delta d" id="kpi-fills-d"></div></div>
+  <div class="kpi"><div class="label">Open Orders</div><div class="value" id="kpi-orders">--</div><div class="delta d" id="kpi-orders-d"></div></div>
+</div>
 
-<div class="section-title" style="font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Live Trade Ticker</div>
-<div class="ticker" id="ticker"></div>
+<!-- Main Grid: Charts + Sidebar -->
+<div class="main-grid">
+  <div class="chart-area">
+    <div class="panel-card">
+      <div class="card-header"><span>NAV History</span><span id="nav-val" style="font-family:var(--mono);color:#fff"></span></div>
+      <div id="nav-chart" style="height:260px"></div>
+    </div>
+    <div class="panel-card">
+      <div class="card-header">Market P&L</div>
+      <div id="mpl-chart" style="height:100px"></div>
+    </div>
+  </div>
+  <div class="sidebar">
+    <div class="panel-card">
+      <div class="card-header"><span>Equity Curves</span><span class="b" style="font-size:.65rem">blue = us</span></div>
+      <div id="eq-chart" style="height:200px"></div>
+    </div>
+    <div class="panel-card">
+      <div class="card-header"><span>Leaderboard</span><span id="lb-rank-text" class="b" style="font-family:var(--mono);font-size:.7rem"></span></div>
+      <div id="leaderboard-wrap" style="max-height:200px;overflow-y:auto"></div>
+    </div>
+  </div>
+</div>
 
+<!-- Tabs -->
 <div class="tabs" id="tab-bar">
   <div class="tab active" data-panel="positions">Positions</div>
-  <div class="tab" data-panel="market">Market (68)</div>
+  <div class="tab" data-panel="market">Market</div>
+  <div class="tab" data-panel="fills">Fills</div>
   <div class="tab" data-panel="orders">Orders</div>
-  <div class="tab" data-panel="leaderboard">Leaderboard</div>
   <div class="tab" data-panel="strategy">Strategy</div>
 </div>
-
 <div class="panel active" id="positions"></div>
 <div class="panel" id="market"></div>
+<div class="panel" id="fills"></div>
 <div class="panel" id="orders"></div>
-<div class="panel" id="leaderboard"></div>
 <div class="panel" id="strategy"></div>
 
-<!-- Order Book Modal -->
-<div class="modal-overlay" id="book-overlay" onclick="closeBook(event)">
+<!-- Contract Detail Modal -->
+<div class="modal-overlay" id="modal-overlay">
   <div class="modal" onclick="event.stopPropagation()">
-    <button class="modal-close" onclick="closeBook()">&times;</button>
-    <h2 id="book-title">Order Book</h2>
-    <div class="modal-sub" id="book-sub"></div>
-    <div id="book-content"></div>
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <h2 id="modal-title">Contract Detail</h2>
+    <div class="modal-sub" id="modal-sub"></div>
+    <div id="modal-price-chart" style="height:200px;margin-bottom:12px"></div>
+    <div id="modal-spread-chart" style="height:100px;margin-bottom:16px"></div>
+    <div id="modal-book"></div>
   </div>
 </div>
 
 <script>
-// ── NAV chart (lightweight-charts) ───────────────────────────
-var navChart = null;
-var navSeries = null;
-var navTickCount = 0;
+var $=function(id){return document.getElementById(id)};
+var LC=window.LightweightCharts;
+var prevSnap={};
+var historyLoaded=false;
+var fillsLoaded=false;
 
-function initNavChart() {
-  if (navChart) return;
-  var el = document.getElementById('nav-chart');
-  if (!el || !window.LightweightCharts) return;
-  navChart = LightweightCharts.createChart(el, {
-    width: el.clientWidth, height: 120,
-    layout: { background: { color: '#161b22' }, textColor: '#8b949e', fontSize: 10, fontFamily: 'SF Mono, Fira Code, monospace' },
-    grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
-    timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#30363d' },
-    rightPriceScale: { borderColor: '#30363d' },
-    crosshair: { mode: 0 },
-  });
-  navSeries = navChart.addAreaSeries({
-    lineColor: '#1f6feb', topColor: '#1f6feb33', bottomColor: '#1f6feb05',
-    lineWidth: 2, priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
-  });
-  window.addEventListener('resize', function() { if (navChart) navChart.applyOptions({ width: el.clientWidth }); });
+/* ── Formatters ──────────────────────────────────────────── */
+function fmt(v,d){d=d||2;return(v>=0?'+':'')+v.toFixed(d)}
+function fmtD(v){return'$'+v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function cc(v){return v>0.005?'g':v<-0.005?'r':'d'}
+function sparkSVG(prices,w,h){
+  w=w||90;h=h||24;
+  if(!prices||prices.length<2) return '<svg width="'+w+'" height="'+h+'"></svg>';
+  var mn=Math.min.apply(null,prices),mx=Math.max.apply(null,prices),rng=mx-mn||1,pad=2,pts=[];
+  for(var i=0;i<prices.length;i++){
+    var x=pad+(i/(prices.length-1))*(w-2*pad);
+    var y=(h-pad)-((prices[i]-mn)/rng)*(h-2*pad);
+    pts.push(x.toFixed(1)+','+y.toFixed(1));
+  }
+  var col=prices[prices.length-1]>=prices[0]?'var(--green)':'var(--red)';
+  return '<svg width="'+w+'" height="'+h+'" style="vertical-align:middle"><polyline points="'+pts.join(' ')+'" fill="none" stroke="'+col+'" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 }
 
-// ── Equity curves chart ───────────────────────────────────────
-var eqChart = null;
-var eqSeriesMap = {};  // uid -> series
-
-// ── Tab switching ──────────────────────────────────────────────
-document.getElementById('tab-bar').addEventListener('click', function(e) {
-  const tab = e.target.closest('.tab');
-  if (!tab) return;
-  const panelId = tab.dataset.panel;
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById(panelId).classList.add('active');
-  tab.classList.add('active');
-});
-
-function c(v) { return v > 0.005 ? 'g' : v < -0.005 ? 'r' : 'd'; }
-function f(v, d) { d = d || 2; return (v > 0 ? '+' : '') + v.toFixed(d); }
-function $(id) { return document.getElementById(id); }
-
-// ── SVG Sparkline generator ────────────────────────────────────
-function sparklineSVG(prices, w, h, color) {
-  w = w || 90; h = h || 24; color = color || '#58a6ff';
-  if (!prices || prices.length < 2) {
-    return '<svg width="'+w+'" height="'+h+'"><text x="'+w/2+'" y="'+h/2+'" fill="#484f58" font-size="9" text-anchor="middle" dominant-baseline="middle">---</text></svg>';
-  }
-  var mn = Math.min.apply(null, prices);
-  var mx = Math.max.apply(null, prices);
-  var range = mx - mn || 1;
-  var pad = 2;
-  var pts = [];
-  for (var i = 0; i < prices.length; i++) {
-    var x = pad + (i / (prices.length - 1)) * (w - 2 * pad);
-    var y = (h - pad) - ((prices[i] - mn) / range) * (h - 2 * pad);
-    pts.push(x.toFixed(1) + ',' + y.toFixed(1));
-  }
-  // Determine color from trend
-  var endColor = prices[prices.length - 1] >= prices[0] ? '#00e676' : '#ff5252';
-  return '<svg width="'+w+'" height="'+h+'" style="vertical-align:middle">' +
-    '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + endColor + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
-    '<circle cx="' + pts[pts.length-1].split(',')[0] + '" cy="' + pts[pts.length-1].split(',')[1] + '" r="2" fill="' + endColor + '"/>' +
-    '</svg>';
-}
-
-// ── NAV line chart ─────────────────────────────────────────────
-function navChartSVG(data) {
-  var w = 900, h = 80;
-  if (!data || data.length < 2) {
-    return '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '"><text x="' + w/2 + '" y="' + h/2 + '" fill="#484f58" font-size="12" text-anchor="middle">Collecting data...</text></svg>';
-  }
-  var vals = data.map(function(d) { return d.nav; });
-  var mn = Math.min.apply(null, vals);
-  var mx = Math.max.apply(null, vals);
-  var range = mx - mn || 1;
-  var pad = 4;
-  var pts = [];
-  var fillPts = [];
-  for (var i = 0; i < vals.length; i++) {
-    var x = pad + (i / (vals.length - 1)) * (w - 2 * pad);
-    var y = (h - pad) - ((vals[i] - mn) / range) * (h - 2 * pad);
-    pts.push(x.toFixed(1) + ',' + y.toFixed(1));
-    fillPts.push(x.toFixed(1) + ',' + y.toFixed(1));
-  }
-  // Close the fill polygon
-  fillPts.push((w - pad).toFixed(1) + ',' + (h - pad).toFixed(1));
-  fillPts.push(pad.toFixed(1) + ',' + (h - pad).toFixed(1));
-
-  var endVal = vals[vals.length - 1];
-  var startVal = vals[0];
-  var lineColor = endVal >= startVal ? '#00e676' : '#ff5252';
-  var fillColor = endVal >= startVal ? '#00e67615' : '#ff525215';
-
-  // Y-axis labels
-  var labels = '<text x="' + (w - 4) + '" y="12" fill="#8b949e" font-size="10" text-anchor="end" font-family="SF Mono,Fira Code,monospace">$' + mx.toFixed(2) + '</text>' +
-    '<text x="' + (w - 4) + '" y="' + (h - 2) + '" fill="#8b949e" font-size="10" text-anchor="end" font-family="SF Mono,Fira Code,monospace">$' + mn.toFixed(2) + '</text>';
-
-  // Current value label
-  var lastX = pts[pts.length-1].split(',')[0];
-  var lastY = pts[pts.length-1].split(',')[1];
-  var curLabel = '<text x="' + (parseFloat(lastX) - 4) + '" y="' + (parseFloat(lastY) - 6) + '" fill="' + lineColor + '" font-size="11" text-anchor="end" font-weight="700" font-family="SF Mono,Fira Code,monospace">$' + endVal.toFixed(2) + '</text>';
-
-  return '<svg width="100%" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
-    '<polygon points="' + fillPts.join(' ') + '" fill="' + fillColor + '"/>' +
-    '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + lineColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
-    '<circle cx="' + lastX + '" cy="' + lastY + '" r="3" fill="' + lineColor + '"/>' +
-    labels + curLabel +
-    '</svg>';
-}
-
-// ── Order book modal ───────────────────────────────────────────
-function openBook(symbol) {
-  $('book-overlay').classList.add('show');
-  $('book-title').textContent = symbol + ' Order Book';
-  $('book-sub').textContent = 'Loading...';
-  $('book-content').innerHTML = '';
-  fetch('/api/book/' + encodeURIComponent(symbol))
-    .then(function(r) { return r.json(); })
-    .then(function(d) { renderBook(d); })
-    .catch(function(err) { $('book-sub').textContent = 'Error: ' + err; });
-}
-function closeBook(e) {
-  if (e && e.target !== $('book-overlay')) return;
-  $('book-overlay').classList.remove('show');
-}
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') $('book-overlay').classList.remove('show');
-});
-
-function renderBook(d) {
-  var maxQty = 1;
-  d.bids.forEach(function(b) { if (b[1] > maxQty) maxQty = b[1]; });
-  d.asks.forEach(function(a) { if (a[1] > maxQty) maxQty = a[1]; });
-
-  $('book-sub').textContent = 'FV: $' + d.fv.toFixed(2) + '  |  ' + d.bids.length + ' bid levels, ' + d.asks.length + ' ask levels';
-
-  var html = '<div class="book-fv">Fair Value: $' + d.fv.toFixed(2) + '</div>';
-  html += '<div class="book-ladder">';
-
-  // Bids side
-  html += '<div class="book-side"><h3>Bids</h3>';
-  for (var i = 0; i < d.bids.length; i++) {
-    var b = d.bids[i];
-    var pct = Math.round((b[1] / maxQty) * 100);
-    html += '<div class="book-row">' +
-      '<span class="price g">' + b[0].toFixed(2) + '</span>' +
-      '<span class="qty">' + b[1] + '</span>' +
-      '<div class="book-bar bid-bar" style="width:' + pct + '%"></div>' +
-      '</div>';
-  }
-  if (!d.bids.length) html += '<div class="d" style="text-align:center;padding:12px">No bids</div>';
-  html += '</div>';
-
-  // Asks side
-  html += '<div class="book-side"><h3>Asks</h3>';
-  for (var i = 0; i < d.asks.length; i++) {
-    var a = d.asks[i];
-    var pct = Math.round((a[1] / maxQty) * 100);
-    html += '<div class="book-row">' +
-      '<span class="price r">' + a[0].toFixed(2) + '</span>' +
-      '<span class="qty">' + a[1] + '</span>' +
-      '<div class="book-bar ask-bar" style="width:' + pct + '%"></div>' +
-      '</div>';
-  }
-  if (!d.asks.length) html += '<div class="d" style="text-align:center;padding:12px">No asks</div>';
-  html += '</div>';
-
-  html += '</div>';
-  $('book-content').innerHTML = html;
-}
-
-// ── SSE Stream ─────────────────────────────────────────────────
-var src = new EventSource('/stream');
-src.onmessage = function(e) {
-  var d = JSON.parse(e.data);
-  $('sub').textContent = 'Live  |  ' + new Date().toLocaleTimeString();
-
-  // ── NAV chart update ─────────────────────────────────────────
-  initNavChart();
-  if (navSeries) {
-    navTickCount++;
-    navSeries.update({ time: navTickCount, value: d.nav });
-  }
-
-  // ── Cards ────────────────────────────────────────────────────
-  $('cards').innerHTML =
-    '<div class="card"><div class="l">NAV</div><div class="v" style="color:#e6edf3">$' + d.nav.toLocaleString(undefined,{minimumFractionDigits:2}) + '</div></div>' +
-    '<div class="card"><div class="l">Cash</div><div class="v" style="color:#58a6ff">$' + d.cash.toLocaleString(undefined,{minimumFractionDigits:2}) + '</div></div>' +
-    '<div class="card"><div class="l">Unrealized P&L</div><div class="v ' + c(d.pnl) + '">' + f(d.pnl) + '</div></div>' +
-    '<div class="card"><div class="l">Market P&L</div><div class="v ' + c(d.market_pl) + '">' + f(d.market_pl) + '</div></div>' +
-    '<div class="card"><div class="l">Fills (M/T)</div><div class="v">' + d.maker_qty.toLocaleString() + '/' + d.taker_qty.toLocaleString() + '</div></div>' +
-    '<div class="card"><div class="l">Open Orders</div><div class="v">' + d.n_orders + '</div></div>' +
-    '<div class="card"><div class="l">Orders Sent</div><div class="v">' + d.total_orders.toLocaleString() + '</div></div>';
-
-  // ── Ticker ───────────────────────────────────────────────────
-  var tk = '';
-  var trades = d.recent_trades.slice(0, 25);
-  for (var i = 0; i < trades.length; i++) {
-    var t = trades[i];
-    var side = t.qty > 0 ? 'BUY' : 'SELL';
-    var sc = t.qty > 0 ? 'g' : 'r';
-    var ours = t.ours ? 'ours' : '';
-    var ts = new Date(t.ts * 1000).toLocaleTimeString();
-    tk += '<div class="ticker-row ' + ours + '"><span class="d" style="width:70px">' + ts + '</span><span class="sym">' + t.sym + '</span><span class="' + sc + '" style="width:40px">' + side + '</span><span class="n" style="width:50px">' + Math.abs(t.qty) + '</span><span class="n" style="width:70px">@' + t.px.toFixed(2) + '</span></div>';
-  }
-  $('ticker').innerHTML = tk;
-
-  // ── Positions (with sparklines) ──────────────────────────────
-  var ph = '<table><thead><tr><th>Team</th><th class="n">Pos</th><th class="n">FV</th><th class="n">Bid</th><th class="n">Ask</th><th class="n">Mid</th><th class="n">Edge</th><th class="n">P&L/ct</th><th class="n">Total P&L</th><th class="n">Volume</th><th>Trend</th></tr></thead><tbody>';
-  for (var i = 0; i < d.positions.length; i++) {
-    var r = d.positions[i];
-    var pc = c(r.pnl_total);
-    var bb = r.bb != null ? r.bb.toFixed(2) : '---';
-    var ba = r.ba != null ? r.ba.toFixed(2) : '---';
-    var mid = r.mid != null ? r.mid.toFixed(2) : '---';
-    var edge = r.mid != null ? (r.fv - r.mid).toFixed(2) : '---';
-    var ec = r.mid != null ? c(r.fv - r.mid) : 'd';
-    ph += '<tr>' +
-      '<td><span class="team-link" onclick="openBook(\'' + r.team.replace(/'/g, "\\'") + '\')">' + r.team + '</span></td>' +
-      '<td class="n">' + (r.qty > 0 ? '+' : '') + r.qty + '</td>' +
-      '<td class="n">' + r.fv.toFixed(2) + '</td>' +
-      '<td class="n g">' + bb + '</td>' +
-      '<td class="n r">' + ba + '</td>' +
-      '<td class="n">' + mid + '</td>' +
-      '<td class="n ' + ec + '">' + edge + '</td>' +
-      '<td class="n ' + pc + '">' + f(r.pnl_per) + '</td>' +
-      '<td class="n ' + pc + '">' + f(r.pnl_total) + '</td>' +
-      '<td class="n d">' + r.vol.toLocaleString() + '</td>' +
-      '<td class="sparkline-cell">' + sparklineSVG(r.sparkline) + '</td>' +
-      '</tr>';
-  }
-  ph += '</tbody></table>';
-  $('positions').innerHTML = ph;
-
-  // ── Market overview (with sparklines) ────────────────────────
-  var mh = '<table><thead><tr><th>Team</th><th class="n">FV</th><th class="n">Bid</th><th class="n">Ask</th><th class="n">Mid</th><th class="n">Edge</th><th class="n">Pos</th><th class="n">Volume</th><th>Trend</th></tr></thead><tbody>';
-  for (var i = 0; i < d.market.length; i++) {
-    var m = d.market[i];
-    var bb = m.bb != null ? m.bb.toFixed(2) : '---';
-    var ba = m.ba != null ? m.ba.toFixed(2) : '---';
-    var mid = m.mid != null ? m.mid.toFixed(2) : '---';
-    var ec = c(m.edge);
-    var pc = m.pos !== 0 ? (m.pos > 0 ? 'g' : 'r') : 'd';
-    mh += '<tr>' +
-      '<td><span class="team-link" onclick="openBook(\'' + m.sym.replace(/'/g, "\\'") + '\')">' + m.sym + '</span></td>' +
-      '<td class="n">' + m.fv.toFixed(2) + '</td>' +
-      '<td class="n g">' + bb + '</td>' +
-      '<td class="n r">' + ba + '</td>' +
-      '<td class="n">' + mid + '</td>' +
-      '<td class="n ' + ec + '">' + f(m.edge) + '</td>' +
-      '<td class="n ' + pc + '">' + (m.pos !== 0 ? ((m.pos > 0 ? '+' : '') + m.pos) : '-') + '</td>' +
-      '<td class="n d">' + m.vol.toLocaleString() + '</td>' +
-      '<td class="sparkline-cell">' + sparklineSVG(m.sparkline) + '</td>' +
-      '</tr>';
-  }
-  mh += '</tbody></table>';
-  $('market').innerHTML = mh;
-
-  // ── Orders ───────────────────────────────────────────────────
-  var oh = '<table><thead><tr><th>Symbol</th><th>Side</th><th class="n">Price</th><th class="n">Qty</th><th>ID</th></tr></thead><tbody>';
-  for (var i = 0; i < d.orders.length; i++) {
-    var o = d.orders[i];
-    var sc = o.side === 'BID' ? 'g' : 'r';
-    oh += '<tr><td>' + o.sym + '</td><td class="' + sc + '">' + o.side + '</td><td class="n">' + o.px.toFixed(2) + '</td><td class="n">' + o.qty + '</td><td class="d" style="font-size:.7rem">' + o.id + '</td></tr>';
-  }
-  if (!d.orders.length) oh += '<tr><td colspan="5" class="d" style="text-align:center">No open orders</td></tr>';
-  oh += '</tbody></table>';
-  $('orders').innerHTML = oh;
-
-  // ── Leaderboard ──────────────────────────────────────────────
-  var lb = d.leaderboard || [];
-  var lh = '<table><thead><tr><th class="n" style="width:40px">Rank</th><th class="n">User ID</th><th class="n">Est. P&L</th><th class="n">Trades</th><th class="n">Contracts</th><th></th></tr></thead><tbody>';
-  for (var i = 0; i < lb.length; i++) {
-    var p = lb[i];
-    var rowCls = p.is_us ? 'lb-us' : '';
-    var pnlCls = c(p.pnl);
-    var tag = p.is_us ? '<span class="badge badge-mm" style="margin-left:8px">US</span>' : '';
-    var medal = p.rank <= 3 ? ['', '#ffd700', '#c0c0c0', '#cd7f32'][p.rank] : '';
-    var rankDisp = medal ? '<span style="color:' + medal + '">#' + p.rank + '</span>' : '#' + p.rank;
-    lh += '<tr class="' + rowCls + '">' +
-      '<td class="n lb-rank">' + rankDisp + '</td>' +
-      '<td class="n">' + p.uid + tag + '</td>' +
-      '<td class="n ' + pnlCls + '">' + f(p.pnl) + '</td>' +
-      '<td class="n">' + p.trades.toLocaleString() + '</td>' +
-      '<td class="n">' + p.n_contracts + '</td>' +
-      '<td></td>' +
-      '</tr>';
-  }
-  if (!lb.length) lh += '<tr><td colspan="6" class="d" style="text-align:center">No trade data yet</td></tr>';
-  lh += '</tbody></table>';
-  // Find our rank
-  var ourEntry = lb.find(function(x) { return x.is_us; });
-  var ourRankText = ourEntry ? 'Our rank: #' + ourEntry.rank + ' of ' + lb.length + '  |  Est. P&L: ' + f(ourEntry.pnl) : 'Not found in leaderboard';
-
-  // ── Equity Curves Chart (lightweight-charts) ─────────────────
-  var eq = d.equity_curves || [];
-  var eqHtml = '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:16px">' +
-    '<div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin-bottom:6px">Competitor Equity Curves (blue = us)</div>' +
-    '<div id="eq-chart" style="height:250px"></div></div>';
-
-  $('leaderboard').innerHTML = '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;margin-bottom:12px;font-family:SF Mono,Fira Code,monospace;font-size:.85rem"><span class="b">' + ourRankText + '</span></div>' + eqHtml + lh;
-
-  // Build equity chart if we have data and the container exists
-  var eqEl = document.getElementById('eq-chart');
-  if (eqEl && eq.length > 0 && window.LightweightCharts) {
-    var ch = LightweightCharts.createChart(eqEl, {
-      width: eqEl.clientWidth, height: 250,
-      layout: { background: { color: '#161b22' }, textColor: '#8b949e', fontSize: 10, fontFamily: 'SF Mono, Fira Code, monospace' },
-      grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
-      timeScale: { visible: false },
-      rightPriceScale: { borderColor: '#30363d' },
-      crosshair: { mode: 0 },
-    });
-    var eqColors = ['#8b949e','#6e7681','#636e7b','#768390','#545d68','#e3b341','#ff5252','#00e676','#58a6ff','#d2a8ff','#79c0ff','#a5d6ff','#ffa657','#f85149','#3fb950'];
-    var ci = 0;
-    for (var i = 0; i < eq.length; i++) {
-      var curve = eq[i];
-      if (curve.uid === 634) continue; // Skip whale outlier
-      if (curve.curve.length < 2) continue;
-      var color = curve.is_us ? '#1f6feb' : eqColors[ci % eqColors.length];
-      var width = curve.is_us ? 3 : 1;
-      var series = ch.addLineSeries({ color: color, lineWidth: width, priceLineVisible: false, lastValueVisible: curve.is_us, crosshairMarkerVisible: false });
-      var pts = [];
-      for (var j = 0; j < curve.curve.length; j++) {
-        pts.push({ time: j, value: curve.curve[j] });
-      }
-      series.setData(pts);
-      ci++;
-    }
-    ch.timeScale().fitContent();
-  }
-
-  // ── Strategy panel ───────────────────────────────────────────
-  var st = d.strategy || [];
-  var sh = '<table><thead><tr><th>Team</th><th class="n">Pos</th><th>Strategy</th><th class="n">Hurst</th><th>Regime</th><th class="n">FV</th><th class="n">Mid</th><th class="n">Edge</th></tr></thead><tbody>';
-  for (var i = 0; i < st.length; i++) {
-    var s = st[i];
-    var regimeBadge = s.regime === 'mean-revert' ? 'badge-mr' : s.regime === 'trending' ? 'badge-tr' : 'badge-rw';
-    var hurstColor = s.hurst < 0.45 ? 'g' : s.hurst > 0.55 ? 'y' : 'd';
-    var mid = s.mid != null ? s.mid.toFixed(2) : '---';
-    var ec = c(s.edge);
-    sh += '<tr>' +
-      '<td><span class="team-link" onclick="openBook(\'' + s.team.replace(/'/g, "\\'") + '\')">' + s.team + '</span></td>' +
-      '<td class="n">' + (s.qty > 0 ? '+' : '') + s.qty + '</td>' +
-      '<td><span class="badge badge-mm">adaptive_mm</span></td>' +
-      '<td class="n ' + hurstColor + '">' + s.hurst.toFixed(2) + '</td>' +
-      '<td><span class="badge ' + regimeBadge + '">' + s.regime + '</span></td>' +
-      '<td class="n">' + s.fv.toFixed(2) + '</td>' +
-      '<td class="n">' + mid + '</td>' +
-      '<td class="n ' + ec + '">' + f(s.edge) + '</td>' +
-      '</tr>';
-  }
-  if (!st.length) sh += '<tr><td colspan="8" class="d" style="text-align:center">No active positions</td></tr>';
-  sh += '</tbody></table>';
-  $('strategy').innerHTML = sh;
+/* ── Chart theme ─────────────────────────────────────────── */
+var chartOpts={
+  layout:{background:{color:'#111820'},textColor:'#8b949e',fontSize:10,fontFamily:'JetBrains Mono,monospace'},
+  grid:{vertLines:{color:'#1b2430'},horzLines:{color:'#1b2430'}},
+  crosshair:{mode:0},
+  rightPriceScale:{borderColor:'#1b2430'},
+  timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#1b2430'},
 };
 
-src.onerror = function() { $('sub').textContent = 'Reconnecting...'; };
+/* ── NAV Chart ───────────────────────────────────────────── */
+var navChart,navSeries,mplChart,mplSeries;
+function initCharts(){
+  if(navChart) return;
+  var el=$('nav-chart');
+  if(!el||!LC) return;
+  navChart=LC.createChart(el,Object.assign({},chartOpts,{width:el.clientWidth,height:260}));
+  navSeries=navChart.addAreaSeries({lineColor:'#3b82f6',topColor:'rgba(59,130,246,0.12)',bottomColor:'rgba(59,130,246,0)',lineWidth:2,priceFormat:{type:'price',precision:2,minMove:0.01}});
+
+  var el2=$('mpl-chart');
+  mplChart=LC.createChart(el2,Object.assign({},chartOpts,{width:el2.clientWidth,height:100}));
+  mplSeries=mplChart.addAreaSeries({lineColor:'#00d4aa',topColor:'rgba(0,212,170,0.1)',bottomColor:'rgba(0,212,170,0)',lineWidth:1.5,priceFormat:{type:'price',precision:2,minMove:0.01}});
+
+  window.addEventListener('resize',function(){
+    navChart.applyOptions({width:$('nav-chart').clientWidth});
+    mplChart.applyOptions({width:$('mpl-chart').clientWidth});
+    if(eqChart) eqChart.applyOptions({width:$('eq-chart').clientWidth});
+  });
+}
+
+/* ── Load PNL History ────────────────────────────────────── */
+function loadHistory(){
+  if(historyLoaded) return;
+  historyLoaded=true;
+  fetch('/api/history/pnl?hours=48&interval=5m').then(function(r){return r.json()}).then(function(d){
+    if(!d.times||!d.times.length) return;
+    var navPts=[],mplPts=[];
+    for(var i=0;i<d.times.length;i++){
+      var t=Math.floor(new Date(d.times[i]).getTime()/1000);
+      if(d.nav[i]!=null) navPts.push({time:t,value:d.nav[i]});
+      if(d.market_pl[i]!=null) mplPts.push({time:t,value:d.market_pl[i]});
+    }
+    if(navPts.length) navSeries.setData(navPts);
+    if(mplPts.length) mplSeries.setData(mplPts);
+    navChart.timeScale().fitContent();
+    mplChart.timeScale().fitContent();
+  }).catch(function(){});
+}
+
+/* ── Load Fills ──────────────────────────────────────────── */
+function loadFills(){
+  if(fillsLoaded) return;
+  fillsLoaded=true;
+  fetch('/api/history/fills?hours=48').then(function(r){return r.json()}).then(function(d){
+    renderFills(d.fills||[]);
+  }).catch(function(){});
+}
+function renderFills(fills){
+  var h='<table><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="n">Price</th><th class="n">Qty</th><th class="n">Edge</th></tr></thead><tbody>';
+  for(var i=0;i<fills.length;i++){
+    var f=fills[i];
+    var sc=f.side==='BUY'?'g':'r';
+    var ts=new Date(f.ts).toLocaleTimeString();
+    var edge=f.edge!=null?fmt(f.edge,4):'--';
+    var ec=f.edge!=null?cc(f.edge):'d';
+    h+='<tr><td class="d">'+ts+'</td><td><span class="team-link" onclick="openModal(\''+f.symbol.replace(/'/g,"\\'")+ '\')">'+f.symbol+'</span></td><td class="'+sc+'">'+f.side+'</td><td class="n">'+f.price.toFixed(2)+'</td><td class="n">'+f.qty+'</td><td class="n '+ec+'">'+edge+'</td></tr>';
+  }
+  if(!fills.length) h+='<tr><td colspan="6" class="d" style="text-align:center;padding:20px">No fills yet</td></tr>';
+  h+='</tbody></table>';
+  $('fills').innerHTML=h;
+}
+
+/* ── Equity Curves ───────────────────────────────────────── */
+var eqChart=null;
+function buildEqChart(curves){
+  var el=$('eq-chart');if(!el||!LC||!curves.length) return;
+  if(eqChart){eqChart.remove();eqChart=null;}
+  eqChart=LC.createChart(el,Object.assign({},chartOpts,{width:el.clientWidth,height:200,timeScale:{visible:false}}));
+  var grays=['#6e7681','#545d68','#768390','#636e7b','#8b949e','#e3b341','#ff4757','#00d4aa','#d2a8ff','#ffa657'];
+  var ci=0;
+  for(var i=0;i<curves.length;i++){
+    var c=curves[i];
+    if(c.uid===634||c.curve.length<2) continue;
+    var col=c.is_us?'#3b82f6':grays[ci%grays.length];
+    var w=c.is_us?3:1;
+    var s=eqChart.addLineSeries({color:col,lineWidth:w,priceLineVisible:false,lastValueVisible:c.is_us,crosshairMarkerVisible:false});
+    var pts=[];for(var j=0;j<c.curve.length;j++) pts.push({time:j,value:c.curve[j]});
+    s.setData(pts);ci++;
+  }
+  eqChart.timeScale().fitContent();
+}
+
+/* ── Tab switching ───────────────────────────────────────── */
+$('tab-bar').addEventListener('click',function(e){
+  var tab=e.target.closest('.tab');if(!tab) return;
+  var p=tab.dataset.panel;
+  document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('active')});
+  document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});
+  $(p).classList.add('active');tab.classList.add('active');
+  if(p==='fills') loadFills();
+});
+
+/* ── Contract Detail Modal ───────────────────────────────── */
+function openModal(symbol){
+  $('modal-overlay').classList.add('show');
+  $('modal-title').textContent=symbol;
+  $('modal-sub').textContent='Loading...';
+  $('modal-price-chart').innerHTML='';
+  $('modal-spread-chart').innerHTML='';
+  $('modal-book').innerHTML='';
+  Promise.all([
+    fetch('/api/book/'+encodeURIComponent(symbol)).then(function(r){return r.json()}),
+    fetch('/api/history/trades/'+encodeURIComponent(symbol)+'?hours=24&limit=200').then(function(r){return r.json()}).catch(function(){return{trades:[]}}),
+    fetch('/api/history/spreads?hours=6&symbol='+encodeURIComponent(symbol)).then(function(r){return r.json()}).catch(function(){return{data:[]}})
+  ]).then(function(results){
+    var book=results[0],trades=results[1],spreads=results[2];
+    $('modal-sub').textContent='FV: $'+book.fv.toFixed(2)+' | '+book.bids.length+' bids, '+book.asks.length+' asks';
+    // Price chart
+    if(trades.trades&&trades.trades.length>1){
+      var el=$('modal-price-chart');
+      var ch=LC.createChart(el,Object.assign({},chartOpts,{width:el.clientWidth,height:200}));
+      var ls=ch.addLineSeries({color:'#3b82f6',lineWidth:2,priceLineVisible:false});
+      var fvLine=ch.addLineSeries({color:'#e3b341',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:true});
+      var pts=[];
+      var t=trades.trades.slice().reverse();
+      for(var i=0;i<t.length;i++){
+        var ts=Math.floor(new Date(t[i].ts).getTime()/1000);
+        pts.push({time:ts,value:t[i].price});
+      }
+      ls.setData(pts);
+      if(pts.length>=2) fvLine.setData([{time:pts[0].time,value:book.fv},{time:pts[pts.length-1].time,value:book.fv}]);
+      ch.timeScale().fitContent();
+    }
+    // Spread chart
+    if(spreads.data&&spreads.data.length>1){
+      var el2=$('modal-spread-chart');
+      var ch2=LC.createChart(el2,Object.assign({},chartOpts,{width:el2.clientWidth,height:100}));
+      var ss=ch2.addAreaSeries({lineColor:'#e3b341',topColor:'rgba(227,179,65,0.1)',bottomColor:'rgba(227,179,65,0)',lineWidth:1.5});
+      var spts=[];
+      for(var i=0;i<spreads.data.length;i++){
+        var sd=spreads.data[i];
+        if(sd.spread!=null) spts.push({time:Math.floor(new Date(sd.ts).getTime()/1000),value:sd.spread});
+      }
+      ss.setData(spts);ch2.timeScale().fitContent();
+    }
+    // Order book
+    renderBook(book);
+  }).catch(function(err){$('modal-sub').textContent='Error: '+err});
+}
+function renderBook(d){
+  var maxQ=1;
+  d.bids.forEach(function(b){if(b[1]>maxQ)maxQ=b[1]});
+  d.asks.forEach(function(a){if(a[1]>maxQ)maxQ=a[1]});
+  var h='<div class="book-fv">Fair Value: $'+d.fv.toFixed(2)+'</div><div class="book-ladder"><div class="book-side"><h3>Bids</h3>';
+  for(var i=0;i<d.bids.length;i++){
+    var b=d.bids[i],pct=Math.round(b[1]/maxQ*100);
+    h+='<div class="book-row"><span class="price g">'+b[0].toFixed(2)+'</span><span class="qty">'+b[1]+'</span><div class="book-bar bid-bar" style="width:'+pct+'%"></div></div>';
+  }
+  if(!d.bids.length) h+='<div class="d" style="text-align:center;padding:12px">No bids</div>';
+  h+='</div><div class="book-side"><h3>Asks</h3>';
+  for(var i=0;i<d.asks.length;i++){
+    var a=d.asks[i],pct=Math.round(a[1]/maxQ*100);
+    h+='<div class="book-row"><span class="price r">'+a[0].toFixed(2)+'</span><span class="qty">'+a[1]+'</span><div class="book-bar ask-bar" style="width:'+pct+'%"></div></div>';
+  }
+  if(!d.asks.length) h+='<div class="d" style="text-align:center;padding:12px">No asks</div>';
+  h+='</div></div>';
+  $('modal-book').innerHTML=h;
+}
+function closeModal(e){
+  if(e&&e.target!==$('modal-overlay')) return;
+  $('modal-overlay').classList.remove('show');
+}
+$('modal-overlay').addEventListener('click',closeModal);
+document.addEventListener('keydown',function(e){if(e.key==='Escape')$('modal-overlay').classList.remove('show')});
+
+/* ── KPI updater with deltas ─────────────────────────────── */
+function updateKPI(id,val,prev,formatter){
+  var el=$(id);el.textContent=formatter?formatter(val):val;
+  var dEl=$(id+'-d');if(!dEl||prev==null) return;
+  var diff=val-prev;
+  if(Math.abs(diff)<0.001){dEl.textContent='';return}
+  dEl.textContent=(diff>=0?'+':'')+diff.toFixed(2);
+  dEl.className='delta '+(diff>=0?'g':'r');
+}
+
+/* ── SSE Stream ──────────────────────────────────────────── */
+var src=new EventSource('/stream');
+src.onmessage=function(e){
+  var d=JSON.parse(e.data);
+  var now=new Date();
+  $('timestamp').textContent='LIVE '+now.toLocaleTimeString();
+
+  initCharts();
+  if(!historyLoaded) loadHistory();
+
+  // Append to NAV chart
+  var ts=Math.floor(d.ts||now.getTime()/1000);
+  if(navSeries) navSeries.update({time:ts,value:d.nav});
+  if(mplSeries) mplSeries.update({time:ts,value:d.market_pl});
+  $('nav-val').textContent=fmtD(d.nav);
+
+  // KPIs
+  updateKPI('kpi-nav',d.nav,prevSnap.nav,fmtD);
+  updateKPI('kpi-cash',d.cash,prevSnap.cash,fmtD);
+  $('kpi-mpl').textContent=fmt(d.market_pl);
+  $('kpi-mpl').className='value '+cc(d.market_pl);
+  var ourRank=null;
+  var lb=d.leaderboard||[];
+  for(var i=0;i<lb.length;i++){if(lb[i].is_us){ourRank=lb[i].rank;break}}
+  if(ourRank){$('kpi-rank').textContent='#'+ourRank+' / '+lb.length;$('kpi-rank').className='value b'}
+  $('kpi-fills').textContent=d.maker_qty.toLocaleString()+' / '+d.taker_qty.toLocaleString();
+  $('kpi-orders').textContent=d.n_orders;
+
+  // Regime badge
+  var strats=d.strategy||[];
+  if(strats.length){
+    var mrCount=0,trCount=0;
+    for(var i=0;i<strats.length;i++){if(strats[i].regime==='mean-revert')mrCount++;else if(strats[i].regime==='trending')trCount++}
+    var regime=mrCount>=trCount?'Mean Revert':'Trending';
+    var rb=$('regime-badge');rb.textContent=regime;rb.className='regime-badge '+(mrCount>=trCount?'mr':'tr');
+  }
+
+  // Equity curves
+  buildEqChart(d.equity_curves||[]);
+
+  // Leaderboard
+  var lh='<table><thead><tr><th class="n" style="width:36px">#</th><th>User</th><th class="n">Est. P&L</th><th class="n">Trades</th></tr></thead><tbody>';
+  for(var i=0;i<lb.length;i++){
+    var p=lb[i],cls=p.is_us?'lb-us':'',pc=cc(p.pnl);
+    var medal=p.rank<=3?['','#ffd700','#c0c0c0','#cd7f32'][p.rank]:'';
+    var rk=medal?'<span style="color:'+medal+'">#'+p.rank+'</span>':'#'+p.rank;
+    var tag=p.is_us?' <span class="badge badge-us">US</span>':'';
+    lh+='<tr class="'+cls+'"><td class="n" style="font-weight:700">'+rk+'</td><td>'+p.uid+tag+'</td><td class="n '+pc+'">'+fmt(p.pnl)+'</td><td class="n d">'+p.trades.toLocaleString()+'</td></tr>';
+  }
+  if(!lb.length) lh+='<tr><td colspan="4" class="d" style="text-align:center">No data</td></tr>';
+  lh+='</tbody></table>';
+  $('leaderboard-wrap').innerHTML=lh;
+  if(ourRank) $('lb-rank-text').textContent='#'+ourRank+' of '+lb.length;
+
+  // Positions
+  var ph='<table><thead><tr><th>Team</th><th class="n">Pos</th><th class="n">FV</th><th class="n">Bid</th><th class="n">Ask</th><th class="n">Mid</th><th class="n">Edge</th><th class="n">P&L/ct</th><th class="n">Total P&L</th><th class="n">Vol</th><th>Trend</th></tr></thead><tbody>';
+  for(var i=0;i<d.positions.length;i++){
+    var r=d.positions[i],pc=cc(r.pnl_total);
+    var bb=r.bb!=null?r.bb.toFixed(2):'--',ba=r.ba!=null?r.ba.toFixed(2):'--';
+    var mid=r.mid!=null?r.mid.toFixed(2):'--';
+    var edge=r.mid!=null?(r.fv-r.mid).toFixed(2):'--';
+    var ec=r.mid!=null?cc(r.fv-r.mid):'d';
+    ph+='<tr><td><span class="team-link" onclick="openModal(\''+r.team.replace(/'/g,"\\'")+ '\')">'+r.team+'</span></td><td class="n">'+(r.qty>0?'+':'')+r.qty+'</td><td class="n">'+r.fv.toFixed(2)+'</td><td class="n g">'+bb+'</td><td class="n r">'+ba+'</td><td class="n">'+mid+'</td><td class="n '+ec+'">'+edge+'</td><td class="n '+pc+'">'+fmt(r.pnl_per)+'</td><td class="n '+pc+'">'+fmt(r.pnl_total)+'</td><td class="n d">'+r.vol.toLocaleString()+'</td><td class="sparkline-cell">'+sparkSVG(r.sparkline)+'</td></tr>';
+  }
+  if(!d.positions.length) ph+='<tr><td colspan="11" class="d" style="text-align:center;padding:20px">No positions</td></tr>';
+  ph+='</tbody></table>';
+  $('positions').innerHTML=ph;
+
+  // Market
+  var mh='<table><thead><tr><th>Team</th><th class="n">FV</th><th class="n">Bid</th><th class="n">Ask</th><th class="n">Mid</th><th class="n">Edge</th><th class="n">Pos</th><th class="n">Vol</th><th>Trend</th></tr></thead><tbody>';
+  for(var i=0;i<d.market.length;i++){
+    var m=d.market[i];
+    var bb=m.bb!=null?m.bb.toFixed(2):'--',ba=m.ba!=null?m.ba.toFixed(2):'--';
+    var mid=m.mid!=null?m.mid.toFixed(2):'--',ec=cc(m.edge);
+    var pc=m.pos!==0?(m.pos>0?'g':'r'):'d';
+    mh+='<tr><td><span class="team-link" onclick="openModal(\''+m.sym.replace(/'/g,"\\'")+ '\')">'+m.sym+'</span></td><td class="n">'+m.fv.toFixed(2)+'</td><td class="n g">'+bb+'</td><td class="n r">'+ba+'</td><td class="n">'+mid+'</td><td class="n '+ec+'">'+fmt(m.edge)+'</td><td class="n '+pc+'">'+(m.pos!==0?((m.pos>0?'+':'')+m.pos):'-')+'</td><td class="n d">'+m.vol.toLocaleString()+'</td><td class="sparkline-cell">'+sparkSVG(m.sparkline)+'</td></tr>';
+  }
+  mh+='</tbody></table>';
+  $('market').innerHTML=mh;
+
+  // Orders
+  var oh='<table><thead><tr><th>Symbol</th><th>Side</th><th class="n">Price</th><th class="n">Qty</th><th>ID</th></tr></thead><tbody>';
+  for(var i=0;i<d.orders.length;i++){
+    var o=d.orders[i],sc=o.side==='BID'?'g':'r';
+    oh+='<tr><td>'+o.sym+'</td><td class="'+sc+'">'+o.side+'</td><td class="n">'+o.px.toFixed(2)+'</td><td class="n">'+o.qty+'</td><td class="d" style="font-size:.65rem">'+o.id+'</td></tr>';
+  }
+  if(!d.orders.length) oh+='<tr><td colspan="5" class="d" style="text-align:center;padding:20px">No open orders</td></tr>';
+  oh+='</tbody></table>';
+  $('orders').innerHTML=oh;
+
+  // Strategy
+  var st=d.strategy||[];
+  var sh='<table><thead><tr><th>Team</th><th class="n">Pos</th><th>Strategy</th><th class="n">Hurst</th><th>Regime</th><th class="n">FV</th><th class="n">Mid</th><th class="n">Edge</th></tr></thead><tbody>';
+  for(var i=0;i<st.length;i++){
+    var s=st[i];
+    var rb=s.regime==='mean-revert'?'mr':s.regime==='trending'?'tr':'';
+    var hc=s.hurst<0.45?'g':s.hurst>0.55?'y':'d';
+    var mid=s.mid!=null?s.mid.toFixed(2):'--',ec=cc(s.edge);
+    sh+='<tr><td><span class="team-link" onclick="openModal(\''+s.team.replace(/'/g,"\\'")+ '\')">'+s.team+'</span></td><td class="n">'+(s.qty>0?'+':'')+s.qty+'</td><td><span class="badge badge-us">adaptive_mm</span></td><td class="n '+hc+'">'+s.hurst.toFixed(2)+'</td><td><span class="regime-badge '+rb+'">'+s.regime+'</span></td><td class="n">'+s.fv.toFixed(2)+'</td><td class="n">'+mid+'</td><td class="n '+ec+'">'+fmt(s.edge)+'</td></tr>';
+  }
+  if(!st.length) sh+='<tr><td colspan="8" class="d" style="text-align:center;padding:20px">No active positions</td></tr>';
+  sh+='</tbody></table>';
+  $('strategy').innerHTML=sh;
+
+  prevSnap=d;
+};
+src.onerror=function(){$('timestamp').textContent='Reconnecting...'};
 </script>
 </body></html>"""
 
