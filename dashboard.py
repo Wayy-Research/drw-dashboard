@@ -61,11 +61,11 @@ FAIR_VALUES: dict[str, float] = {
     "Prairie View": 0.00, "Lehigh": 0.02,
 }
 
-# Placeholder Hurst exponents and regime labels per contract
+# Per-contract strategy labels (taker-only vs market-making)
+from mania.config import TAKER_ONLY as _TAKER_ONLY_SET
 HURST_DATA: dict[str, dict[str, Any]] = {
-    sym: {"hurst": round(0.45 + 0.1 * (hash(sym) % 10) / 10, 2),
-           "regime": "mean-revert" if hash(sym) % 3 == 0 else
-                     "trending" if hash(sym) % 3 == 1 else "random-walk"}
+    sym: {"hurst": 0.50,
+           "regime": "taker-only" if sym in _TAKER_ONLY_SET else "market-making"}
     for sym in FAIR_VALUES
 }
 
