@@ -43,11 +43,29 @@ WOMEN_PREFIX = "W"
 # ── Connection ────────────────────────────────────────────────────────
 GAME_ID = 160
 BASE_URL = "https://games.drw.com"
-TOKEN = (
-    "REDACTED_JWT_HEADER"
-    ".REDACTED_JWT_PAYLOAD"
-    ".REDACTED_JWT_SIGNATURE"
-)
+
+
+def _get_drw_token() -> str:
+    """Resolve the DRW trading-simulator auth token from env or config file."""
+    import json
+    import os
+    token = os.environ.get("DRW_TOKEN")
+    if token:
+        return token
+    config_path = Path.home() / ".config" / "wayy" / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        token = cfg.get("drw_token")
+        if token:
+            return token
+    raise RuntimeError(
+        "No DRW auth token found. Set DRW_TOKEN env var or add "
+        "'drw_token' to ~/.config/wayy/config.json"
+    )
+
+
+TOKEN = _get_drw_token()
 OUR_USER_ID = 531
 
 # ── Tournament structure ──────────────────────────────────────────────

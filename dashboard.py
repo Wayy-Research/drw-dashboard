@@ -33,11 +33,28 @@ from starlette.responses import StreamingResponse
 log = logging.getLogger("drw_dashboard")
 
 BASE_URL = "https://games.drw.com/api/games/trading-simulator/160"
-TOKEN = (
-    "REDACTED_JWT_HEADER"
-    ".REDACTED_JWT_PAYLOAD"
-    ".REDACTED_JWT_SIGNATURE"
-)
+
+
+def _get_drw_token() -> str:
+    """Resolve the DRW trading-simulator auth token from env or config file."""
+    import os
+    token = os.environ.get("DRW_TOKEN")
+    if token:
+        return token
+    config_path = Path.home() / ".config" / "wayy" / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        token = cfg.get("drw_token")
+        if token:
+            return token
+    raise RuntimeError(
+        "No DRW auth token found. Set DRW_TOKEN env var or add "
+        "'drw_token' to ~/.config/wayy/config.json"
+    )
+
+
+TOKEN = _get_drw_token()
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
 FAIR_VALUES: dict[str, float] = {
