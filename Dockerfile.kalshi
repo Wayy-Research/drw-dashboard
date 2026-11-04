@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY kalshi_midterms /app/kalshi_midterms
+ENV PYTHONUNBUFFERED=1 PORT=8090
+EXPOSE 8090
+HEALTHCHECK CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8090/healthz')"
+CMD ["python", "-m", "kalshi_midterms"]
