@@ -57,8 +57,9 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <nav id="tabs">
   <button data-tab="long" class="on">Long shots</button>
   <button data-tab="value">All value</button>
+  <button data-tab="arb">Arbitrage</button>
   <button data-tab="races">Races</button>
-  <button data-tab="unmatched">Unmatched</button>
+  <button data-tab="unmatched">Unscored</button>
   <button data-tab="sources">Sources</button>
 </nav>
 <div class="controls" id="controls">
@@ -119,6 +120,14 @@ function render(){
   if(tab==="long"){ const l=[...longs].sort((a,b)=>b.ev_per_dollar-a.ev_per_dollar);
     html=l.length?l.map(card).join(""):`<div class="empty">No long shots clear the filters. Long shot = ask ≤ 25¢ with model probability above cost.</div>`;}
   else if(tab==="value"){ html=ops.length?ops.map(card).join(""):`<div class="empty">No value bets at this edge.</div>`;}
+  else if(tab==="arb"){ const a=snap.arbitrage||[];
+    html=a.length?a.map(x=>`<div class="card"><div class="row"><span class="race">${esc(x.race||x.event)} · ${esc(x.kind)}</span>
+      <b class="edge">+${(x.profit*100).toFixed(1)}¢</b></div><div class="sub">${esc(x.title)}</div>
+      <div class="grid"><div><span>Cost</span>$${x.cost.toFixed(3)}</div><div><span>Pays</span>$${x.payout.toFixed(2)}</div>
+      <div><span>Return</span>${pct(x.profit/x.cost,1)}</div><div><span>Legs</span>${x.legs.length}</div></div>
+      <table>${x.legs.map(l=>`<tr><td>${esc(l.outcome)}</td><td class="n">YES ${c(l.yes_ask)}</td><td class="n">NO ${c(l.no_ask)}</td></tr>`).join("")}</table>
+      <div class="why">Buy ${x.kind==="YES bundle"?"YES":"NO"} on every leg, fees included. Assumes the listed candidates cover every possible winner.</div></div>`).join("")
+      :`<div class="empty">No arbitrage right now. This checks whether buying every candidate in a race costs less than it is guaranteed to pay.</div>`;}
   else if(tab==="races"){ html=(snap.races||[]).map(r=>`<div class="card"><div class="row"><span class="race">${esc(r.race)}</span>
       <span class="sub">${r.reporting==null?"no count":pct(r.reporting)+" reported"} · ${r.n_polls} polls</span></div>
       <table><tr><th>Candidate</th><th>Party</th><th class="n">Poll</th><th class="n">Votes</th></tr>
@@ -128,7 +137,7 @@ function render(){
   else if(tab==="unmatched"){ const u=snap.unmatched||[];
     html=u.length?u.map(x=>`<div class="card"><div class="row"><span class="race">${esc(x.title)}</span><span>${c(x.yes_ask)}</span></div>
       <div class="sub">${esc(x.outcome)} · race: ${esc(x.race||"?")}</div><div class="why">${esc(x.ticker)} — ${esc(x.why)}</div></div>`).join("")
-      :`<div class="empty">Every market matched a race.</div>`;}
+      :`<div class="empty">Every market is scored.</div>`;}
   else { html=Object.entries(snap.sources||{}).map(([k,s])=>`<div class="card"><div class="row"><span class="race">${esc(k)}</span>
       <span class="${s.ok?"ok":"bad"}">${s.ok?"OK":"ERROR"}</span></div><div class="sub">${esc(s.detail)}</div><div class="why">${esc(s.at)}</div></div>`).join("")
       || `<div class="empty">No refresh yet.</div>`;}

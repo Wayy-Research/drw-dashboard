@@ -27,7 +27,7 @@ STATES = {
 POSTALS = set(STATES.values())
 # Longest names first so "West Virginia" wins over "Virginia".
 _STATE_RE = re.compile(r"\b(" + "|".join(sorted(STATES, key=len, reverse=True)) + r")\b", re.I)
-_TICKER_RE = re.compile(r"(?:SENATE|SEN|GOVERNOR|GOV|HOUSE)([A-Z]{2})(\d{1,2})?")
+_TICKER_RE = re.compile(r"(?:SENATE|GOVPARTY|GOVERNOR|GOV|HOUSE)([A-Z]{2})(\d{1,2})?")
 _DISTRICT_RE = re.compile(
     r"\b(?:district|cd)\s*#?\s*(\d{1,2})\b"                       # "district 7"
     r"|\b([A-Z]{2})-(\d{1,2})\b"                                   # "PA-7"
@@ -106,9 +106,14 @@ def parse_outcome(market: dict[str, Any]) -> dict[str, str]:
     label = (market.get("yes_sub_title") or market.get("subtitle")
              or market.get("title") or "").strip()
     party = ""
-    for rx, code in _PARTY_WORDS:
-        if rx.search(label):
-            party = code
+    # Kalshi puts the party in `subtitle` ("Republican party:: Republican party") and
+    # the market title ("Will Republican win ...?"); the YES label is often the name.
+    for text in (label, market.get("subtitle") or "", market.get("title") or ""):
+        for rx, code in _PARTY_WORDS:
+            if rx.search(text):
+                party = code
+                break
+        if party:
             break
     if not party:
         suffix = str(market.get("ticker", "")).rsplit("-", 1)[-1].upper()

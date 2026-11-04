@@ -7,7 +7,8 @@ Environment:
   AP_ELECTION_DATE  default 2026-11-03
   OVERRIDES_FILE    JSON {kalshi_market_ticker: {"race": "GA-SEN", "party": "D", "candidate": "..."}}
   KALSHI_SERIES     comma list of Kalshi series tickers to restrict to (skips discovery)
-  REFRESH_SECONDS   default 30 (markets + results); polls refresh every 10 minutes
+  REFRESH_SECONDS   default 60 (markets + results); polls refresh every 10 minutes
+  SNAPSHOT_FILE     optional path; each snapshot is also written there as JSON
   HOST / PORT       default 0.0.0.0 / 8090
 """
 
@@ -30,7 +31,7 @@ from .value import ScanParams, scan
 
 log = logging.getLogger("kalshi_midterms")
 
-REFRESH = float(os.environ.get("REFRESH_SECONDS", "30"))
+REFRESH = float(os.environ.get("REFRESH_SECONDS", "60"))
 POLL_REFRESH = 600.0
 PAGE = (Path(__file__).parent / "page.html")
 
@@ -122,6 +123,12 @@ def refresh_once() -> None:
             "markets": sum(len(e.get("markets") or []) for e in events),
             **result, "races": race_rows, "sources": dict(_state["sources"]),
         }
+        snap = _state["snapshot"]
+    out = os.environ.get("SNAPSHOT_FILE", "").strip()
+    if out:  # optional: mirror each snapshot to disk for static publishing
+        tmp = Path(out).with_suffix(".tmp")
+        tmp.write_text(json.dumps(snap))
+        tmp.replace(out)
 
 
 def _loop() -> None:

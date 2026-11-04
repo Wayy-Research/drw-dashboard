@@ -13,7 +13,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.11.9"
       - key: REFRESH_SECONDS
-        value: "30"
+        value: "60"
       # CSV/JSON URL (e.g. a Google Sheet published as CSV) or a repo path
       - key: POLLS_SOURCE
         sync: false

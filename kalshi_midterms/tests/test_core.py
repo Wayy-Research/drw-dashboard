@@ -48,12 +48,20 @@ class TestRaceMatching(unittest.TestCase):
         self.assertEqual(parse_race({"title": "Who will win New York's 22nd congressional district?"}), "NY-H22")
         self.assertEqual(parse_race({"title": "Senate race", "series_ticker": "SENATEMI"}), "MI-SEN")
         self.assertIsNone(parse_race({"title": "Which party will win the House?"}))
+        # real Kalshi shapes
+        self.assertEqual(parse_race({"series_ticker": "GOVPARTYAZ", "event_ticker": "GOVPARTYAZ-26",
+                                     "title": "Who will win the governorship?"}), "AZ-GOV")
+        self.assertEqual(parse_race({"series_ticker": "HOUSEPA10", "event_ticker": "HOUSEPA10-26",
+                                     "title": "Will Republican win the House race for PA-10?"}), "PA-H10")
         self.assertIsNone(parse_race({"title": "Texas state senate district 5"}))
 
     def test_parse_outcome(self):
         self.assertEqual(parse_outcome({"yes_sub_title": "Democratic party"})["party"], "D")
         self.assertEqual(parse_outcome({"yes_sub_title": "Republican"})["party"], "R")
         self.assertEqual(parse_outcome({"yes_sub_title": "Pat Example", "ticker": "X-26-R"})["party"], "R")
+        real = {"yes_sub_title": "Pat Example", "subtitle": "Democratic party:: Democratic party",
+                "title": "Will Democratic win the House race for PA-10?", "ticker": "HOUSEPA10-26-D"}
+        self.assertEqual(parse_outcome(real), {"party": "D", "name": "Pat Example"})
 
     def test_find_by_name_and_party(self):
         r = Race("GA-SEN")
@@ -187,6 +195,30 @@ class TestValue(unittest.TestCase):
         # override pins a market the parser can't read
         out = scan(events, races, overrides={"CONTROLH-26-D": {"race": "GA-SEN", "party": "D"}})
         self.assertFalse(out["unmatched"])
+
+
+class TestArbitrage(unittest.TestCase):
+    def ev(self, d, r):
+        return [{"event_ticker": "E", "title": "Georgia Senate race", "markets": [
+            {"ticker": "E-D", "yes_sub_title": "Democratic party", **d},
+            {"ticker": "E-R", "yes_sub_title": "Republican party", **r}]}]
+
+    def test_yes_bundle(self):
+        from kalshi_midterms.value import find_arbitrage
+        arb = find_arbitrage(self.ev({"yes_ask": 40, "yes_bid": 38}, {"yes_ask": 50, "yes_bid": 48}))
+        self.assertEqual(arb[0]["kind"], "YES bundle")
+        self.assertAlmostEqual(arb[0]["profit"], 1 - (0.40 + 0.0168 + 0.50 + 0.0175), places=4)
+
+    def test_no_bundle(self):
+        from kalshi_midterms.value import find_arbitrage
+        # YES bids sum to 1.10 -> NO asks 0.45 + 0.35 = 0.80 < payout 1
+        arb = find_arbitrage(self.ev({"yes_ask": 60, "yes_bid": 55}, {"yes_ask": 70, "yes_bid": 65}))
+        self.assertEqual([a["kind"] for a in arb], ["NO bundle"])
+
+    def test_fair_market_has_none(self):
+        from kalshi_midterms.value import find_arbitrage
+        self.assertEqual(find_arbitrage(self.ev({"yes_ask": 52, "yes_bid": 50},
+                                                {"yes_ask": 50, "yes_bid": 48})), [])
 
 
 if __name__ == "__main__":

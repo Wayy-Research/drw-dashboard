@@ -101,4 +101,39 @@ def scan(events: list[dict], races: dict[str, Race], overrides: dict[str, dict] 
                 rows.append({**context, "side": side, **ev_side, "flags": flags})
 
     rows.sort(key=lambda r: r["edge"], reverse=True)
-    return {"opportunities": rows, "unmatched": unmatched}
+    return {"opportunities": rows, "unmatched": unmatched,
+            "arbitrage": find_arbitrage(events, params)}
+
+
+def find_arbitrage(events: list[dict], params: ScanParams | None = None) -> list[dict[str, Any]]:
+    """Model-free mispricings inside one race (one market per candidate/party).
+
+    YES bundle: buy YES on every outcome; exactly one pays $1.
+    NO bundle:  buy NO on every outcome; all but one pay $1, so it returns n-1.
+    Both assume the listed outcomes cover every possible winner.
+    """
+    params = params or ScanParams()
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        mks = [m for m in ev.get("markets") or [] if m.get("status") in (None, "active", "open")]
+        if len(mks) < 2:
+            continue
+        quotes = [kalshi.quote(m) for m in mks]
+        fee = lambda p: taker_fee(p, params.fee_contracts, params.fee_rate)  # noqa: E731
+        legs = [{"ticker": m.get("ticker"), "outcome": parse_outcome(m)["name"],
+                 "yes_ask": q["yes_ask"], "no_ask": q["no_ask"]} for m, q in zip(mks, quotes)]
+        base = {"event": ev.get("event_ticker", ""), "title": ev.get("title", ""),
+                "race": parse_race(ev, mks[0]) or "", "legs": legs}
+        if all(q["yes_ask"] is not None for q in quotes):
+            cost = sum(q["yes_ask"] + fee(q["yes_ask"]) for q in quotes)
+            if cost < 1:
+                out.append({**base, "kind": "YES bundle", "cost": round(cost, 4),
+                            "payout": 1.0, "profit": round(1 - cost, 4)})
+        if all(q["no_ask"] is not None for q in quotes):
+            cost = sum(q["no_ask"] + fee(q["no_ask"]) for q in quotes)
+            payout = len(quotes) - 1
+            if cost < payout:
+                out.append({**base, "kind": "NO bundle", "cost": round(cost, 4),
+                            "payout": float(payout), "profit": round(payout - cost, 4)})
+    out.sort(key=lambda a: a["profit"], reverse=True)
+    return out

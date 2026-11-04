@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
+import urllib.error
 from typing import Any
 
 from .fetch import get_json
@@ -17,10 +18,6 @@ log = logging.getLogger("kalshi_midterms.kalshi")
 
 BASE = os.environ.get("KALSHI_BASE", "https://api.elections.kalshi.com/trade-api/v2").rstrip("/")
 
-# Series/event titles that look like individual races (or chamber control,
-# which the matcher later drops because it has no state).
-RACE_RE = re.compile(r"\b(senate|house|governor|gubernatorial|congress(ional)?|district)\b", re.I)
-POLITICS_CATEGORIES = {"politics", "elections"}
 
 
 def price(m: dict[str, Any], field: str) -> float | None:
@@ -76,61 +73,75 @@ def quote(m: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Per-race series on Kalshi: HOUSEPA10, SENATEGA, GOVPARTYAZ (plus KX-prefixed variants).
+RACE_SERIES_RE = re.compile(r"^(?:KX)?(HOUSE|SENATE|GOVPARTY|GOV)([A-Z]{2})(\d{1,2}|AL)?$")
+REQUEST_GAP = float(os.environ.get("KALSHI_REQUEST_GAP", "0.25"))  # seconds between calls
+SERIES_TTL = 3600.0
+_series_cache: dict[str, Any] = {"at": 0.0, "tickers": []}
+
+
+def _get(path: str, params: dict[str, Any]) -> dict:
+    """GET with backoff on 429 (Kalshi rate-limits per IP)."""
+    delay = 2.0
+    for attempt in range(5):
+        try:
+            return get_json(f"{BASE}{path}", params)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")
+
+
 def _paginate(path: str, params: dict[str, Any], key: str, max_pages: int = 25) -> list[dict]:
     out: list[dict] = []
     cursor = None
     for _ in range(max_pages):
-        data = get_json(f"{BASE}{path}", {**params, "cursor": cursor})
+        data = _get(path, {**params, "cursor": cursor})
         out.extend(data.get(key) or [])
         cursor = data.get("cursor")
         if not cursor:
             break
+        time.sleep(REQUEST_GAP)
     return out
 
 
 def discover_series() -> list[str]:
-    """Election race series tickers. KALSHI_SERIES (comma list) overrides discovery."""
+    """Race series tickers, cached for an hour. KALSHI_SERIES (comma list) overrides."""
     override = os.environ.get("KALSHI_SERIES", "").strip()
     if override:
         return [s.strip().upper() for s in override.split(",") if s.strip()]
-    series = get_json(f"{BASE}/series", {"category": "Elections"}).get("series") or []
-    series += get_json(f"{BASE}/series", {"category": "Politics"}).get("series") or []
-    tickers = {s["ticker"] for s in series
-               if s.get("ticker") and RACE_RE.search(s.get("title", "") + " " + s["ticker"])}
-    return sorted(tickers)
+    if _series_cache["tickers"] and time.time() - _series_cache["at"] < SERIES_TTL:
+        return _series_cache["tickers"]
+    tickers: set[str] = set()
+    for cat in ("Elections", "Politics"):
+        for s in _get("/series", {"category": cat}).get("series") or []:
+            if RACE_SERIES_RE.match(s.get("ticker", "")):
+                tickers.add(s["ticker"])
+        time.sleep(REQUEST_GAP)
+    _series_cache.update(at=time.time(), tickers=sorted(tickers))
+    return _series_cache["tickers"]
 
 
-def _events_for_series(ticker: str) -> list[dict]:
-    return _paginate("/events", {"series_ticker": ticker, "status": "open",
-                                 "with_nested_markets": "true", "limit": 200}, "events")
-
-
-def _events_by_scan() -> list[dict]:
-    events = _paginate("/events", {"status": "open", "with_nested_markets": "true",
-                                   "limit": 200}, "events", max_pages=40)
-    return [e for e in events
-            if (e.get("category") or "").lower() in POLITICS_CATEGORIES
-            and RACE_RE.search(f"{e.get('title', '')} {e.get('sub_title', '')}")]
+def _markets_for_series(ticker: str) -> list[dict]:
+    return _paginate("/markets", {"series_ticker": ticker, "status": "open", "limit": 1000},
+                     "markets", max_pages=5)
 
 
 def fetch_events() -> list[dict]:
-    """Open election events with their markets nested under `markets`."""
-    try:
-        series = discover_series()
-    except Exception as exc:  # noqa: BLE001 - fall back to a full scan
-        log.warning("series discovery failed (%s); scanning all open events", exc)
-        series = []
-    if not series:
-        return _dedupe(_events_by_scan())
-    events: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:  # Kalshi basic tier allows ~20 reads/s
-        for batch in pool.map(_events_for_series, series):
-            events.extend(batch)
-    return _dedupe(events)
-
-
-def _dedupe(events: list[dict]) -> list[dict]:
-    seen: dict[str, dict] = {}
-    for e in events:
-        seen.setdefault(e.get("event_ticker") or id(e), e)
-    return list(seen.values())
+    """Open race markets grouped into events: [{event_ticker, series_ticker, title, markets}]."""
+    events: dict[str, dict] = {}
+    for ticker in discover_series():
+        try:
+            markets = _markets_for_series(ticker)
+        except urllib.error.HTTPError as exc:
+            log.warning("series %s: HTTP %s", ticker, exc.code)
+            markets = []
+        for m in markets:
+            et = m.get("event_ticker") or m.get("ticker", "")
+            ev = events.setdefault(et, {"event_ticker": et, "series_ticker": ticker,
+                                        "title": m.get("title", ""), "markets": []})
+            ev["markets"].append(m)
+        time.sleep(REQUEST_GAP)
+    return list(events.values())
