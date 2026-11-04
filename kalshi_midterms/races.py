@@ -28,7 +28,11 @@ POSTALS = set(STATES.values())
 # Longest names first so "West Virginia" wins over "Virginia".
 _STATE_RE = re.compile(r"\b(" + "|".join(sorted(STATES, key=len, reverse=True)) + r")\b", re.I)
 _TICKER_RE = re.compile(r"(?:SENATE|SEN|GOVERNOR|GOV|HOUSE)([A-Z]{2})(\d{1,2})?")
-_DISTRICT_RE = re.compile(r"\b(?:district|cd)\s*#?\s*(\d{1,2})\b|\b([A-Z]{2})-(\d{1,2})\b", re.I)
+_DISTRICT_RE = re.compile(
+    r"\b(?:district|cd)\s*#?\s*(\d{1,2})\b"                       # "district 7"
+    r"|\b([A-Z]{2})-(\d{1,2})\b"                                   # "PA-7"
+    r"|\b(\d{1,2})(?:st|nd|rd|th)\s+(?:congressional\s+)?district\b",  # "7th district"
+    re.I)
 _PARTY_WORDS = [
     (re.compile(r"\bdemocrat(ic|s)?\b|\(d\)|^d$", re.I), "D"),
     (re.compile(r"\brepublican(s)?\b|\bgop\b|\(r\)|^r$", re.I), "R"),
@@ -91,7 +95,7 @@ def parse_race(event: dict[str, Any], market: dict[str, Any] | None = None) -> s
         return f"{state}-HAL"
     d = _DISTRICT_RE.search(text)
     if d:
-        return f"{state}-H{int(d.group(1) or d.group(3))}"
+        return f"{state}-H{int(d.group(1) or d.group(3) or d.group(4))}"
     if t and t.group(2):
         return f"{state}-H{int(t.group(2))}"
     return None
@@ -144,11 +148,13 @@ class Race:
 
     def find(self, party: str = "", name: str = "") -> Candidate | None:
         ln = last_name(name)
+        # Never match a name across parties when both sides know the party.
+        pool = [c for c in self.candidates if not (party and c.party and c.party != party)]
         if ln:
-            for c in self.candidates:
+            for c in pool:
                 if last_name(c.name) == ln:
                     return c
-            for c in self.candidates:  # label may be "Jon Ossoff (D)" or "Ossoff wins"
+            for c in pool:  # label may be "Jon Ossoff (D)" or "Ossoff wins"
                 if c.name and last_name(c.name) in norm_name(name).split():
                     return c
         if party:

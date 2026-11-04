@@ -44,6 +44,8 @@ class TestRaceMatching(unittest.TestCase):
         self.assertEqual(parse_race({"title": "Who will win Arizona's governor race?"}), "AZ-GOV")
         self.assertEqual(parse_race({"title": "California's 13th district: CA-13 House race"}), "CA-H13")
         self.assertEqual(parse_race({"title": "Wyoming at-large House seat"}), "WY-HAL")
+        self.assertEqual(parse_race({"title": "Pennsylvania's 7th district House race"}), "PA-H7")
+        self.assertEqual(parse_race({"title": "Who will win New York's 22nd congressional district?"}), "NY-H22")
         self.assertEqual(parse_race({"title": "Senate race", "series_ticker": "SENATEMI"}), "MI-SEN")
         self.assertIsNone(parse_race({"title": "Which party will win the House?"}))
         self.assertIsNone(parse_race({"title": "Texas state senate district 5"}))
@@ -60,6 +62,14 @@ class TestRaceMatching(unittest.TestCase):
         self.assertEqual(r.find("", "Blake Beta").party, "R")
         self.assertEqual(r.find("", "Beta wins").name, "Blake Beta")
         self.assertEqual(r.find("D", "Democratic party").name, "Alex Alpha")
+
+    def test_shared_last_name_stays_within_party(self):
+        races = {}
+        apply_polls(races, [poll("X-SEN", "Sam Smith", "D", 47), poll("X-SEN", "Pat Smith", "R", 48)], TODAY)
+        r = races["X-SEN"]
+        self.assertEqual(len(r.candidates), 2)
+        self.assertEqual(r.find("R", "Republican party").name, "Pat Smith")
+        self.assertEqual(r.find("R", "Smith").name, "Pat Smith")
 
 
 class TestPollsAndResults(unittest.TestCase):
