@@ -29,6 +29,21 @@ docker run -p 8090:8090 -v $PWD/data:/data \
   -e POLLS_SOURCE=/data/polls.csv -e RESULTS_SOURCE=/data/results.csv kalshi-midterms
 ```
 
+### Render (free, no computer needed)
+
+`render.yaml` at the repo root is a Render Blueprint. On Render: **New → Blueprint**,
+pick this repo, then fill in `POLLS_SOURCE` / `RESULTS_SOURCE` (both optional;
+leave blank to start with Kalshi prices only). Render gives you a public
+`https://….onrender.com` URL.
+
+Render's disk resets on every deploy, so give data sources as **URLs**. A Google
+Sheet works well: *File → Share → Publish to web → CSV*, then paste the link.
+A CSV committed to this repo also works (e.g. `kalshi_midterms/data/polls.csv`),
+and Render redeploys when you push it.
+
+The free plan sleeps after 15 minutes without visitors and takes about a minute
+to wake. Data refreshes only while the page is awake.
+
 ## Data formats
 
 Race keys: `GA-SEN`, `AZ-GOV`, `CA-H13` (House district), `WY-HAL` (at-large seat).
