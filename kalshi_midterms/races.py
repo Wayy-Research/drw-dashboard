@@ -27,7 +27,7 @@ STATES = {
 POSTALS = set(STATES.values())
 # Longest names first so "West Virginia" wins over "Virginia".
 _STATE_RE = re.compile(r"\b(" + "|".join(sorted(STATES, key=len, reverse=True)) + r")\b", re.I)
-_TICKER_RE = re.compile(r"(?:SENATE|GOVPARTY|GOVERNOR|GOV|HOUSE)([A-Z]{2})(\d{1,2})?")
+_TICKER_RE = re.compile(r"(?:SENATE|GOVPARTY|GOVERNOR|GOV|HOUSE)([A-Z]{2})(\d{1,2}|AL)?")
 _DISTRICT_RE = re.compile(
     r"\b(?:district|cd)\s*#?\s*(\d{1,2})\b"                       # "district 7"
     r"|\b([A-Z]{2})-(\d{1,2})\b"                                   # "PA-7"
@@ -91,12 +91,13 @@ def parse_race(event: dict[str, Any], market: dict[str, Any] | None = None) -> s
         return None
     if office != "H":
         return f"{state}-{office}"
-    if "at-large" in low or "at large" in low:
+    if ("at-large" in low or "at large" in low or re.search(r"\b[A-Z]{2}-AL\b", text)
+            or (t and t.group(2) == "AL")):
         return f"{state}-HAL"
     d = _DISTRICT_RE.search(text)
     if d:
         return f"{state}-H{int(d.group(1) or d.group(3) or d.group(4))}"
-    if t and t.group(2):
+    if t and t.group(2) and t.group(2).isdigit():
         return f"{state}-H{int(t.group(2))}"
     return None
 

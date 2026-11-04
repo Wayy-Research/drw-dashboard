@@ -51,6 +51,8 @@ class TestRaceMatching(unittest.TestCase):
         # real Kalshi shapes
         self.assertEqual(parse_race({"series_ticker": "GOVPARTYAZ", "event_ticker": "GOVPARTYAZ-26",
                                      "title": "Who will win the governorship?"}), "AZ-GOV")
+        self.assertEqual(parse_race({"series_ticker": "HOUSEAKAL", "event_ticker": "HOUSEAKAL-26",
+                                     "title": "Will Pat Example win the House race for AK-AL?"}), "AK-HAL")
         self.assertEqual(parse_race({"series_ticker": "HOUSEPA10", "event_ticker": "HOUSEPA10-26",
                                      "title": "Will Republican win the House race for PA-10?"}), "PA-H10")
         self.assertIsNone(parse_race({"title": "Texas state senate district 5"}))

@@ -75,9 +75,12 @@ def quote(m: dict[str, Any]) -> dict[str, Any]:
 
 # Per-race series on Kalshi: HOUSEPA10, SENATEGA, GOVPARTYAZ (plus KX-prefixed variants).
 RACE_SERIES_RE = re.compile(r"^(?:KX)?(HOUSE|SENATE|GOVPARTY|GOV)([A-Z]{2})(\d{1,2}|AL)?$")
-REQUEST_GAP = float(os.environ.get("KALSHI_REQUEST_GAP", "0.25"))  # seconds between calls
+REQUEST_GAP = float(os.environ.get("KALSHI_REQUEST_GAP", "0.6"))  # seconds between calls
 SERIES_TTL = 3600.0
-_series_cache: dict[str, Any] = {"at": 0.0, "tickers": []}
+# Only this election cycle's events (event tickers look like HOUSEPA10-26).
+CYCLE = os.environ.get("KALSHI_CYCLE", "26").strip()
+_series_cache: dict[str, Any] = {"at": 0.0, "tickers": [], "titles": {}}
+_last_markets: dict[str, list[dict]] = {}  # last good fetch per series, reused on 429
 
 
 def _get(path: str, params: dict[str, Any]) -> dict:
@@ -119,6 +122,7 @@ def discover_series() -> list[str]:
         for s in _get("/series", {"category": cat}).get("series") or []:
             if RACE_SERIES_RE.match(s.get("ticker", "")):
                 tickers.add(s["ticker"])
+                _series_cache["titles"][s["ticker"]] = s.get("title", "")
         time.sleep(REQUEST_GAP)
     _series_cache.update(at=time.time(), tickers=sorted(tickers))
     return _series_cache["tickers"]
@@ -135,13 +139,17 @@ def fetch_events() -> list[dict]:
     for ticker in discover_series():
         try:
             markets = _markets_for_series(ticker)
+            _last_markets[ticker] = markets
         except urllib.error.HTTPError as exc:
-            log.warning("series %s: HTTP %s", ticker, exc.code)
-            markets = []
+            log.warning("series %s: HTTP %s (reusing last good data)", ticker, exc.code)
+            markets = _last_markets.get(ticker, [])
         for m in markets:
             et = m.get("event_ticker") or m.get("ticker", "")
+            if CYCLE and not et.endswith(f"-{CYCLE}"):
+                continue
             ev = events.setdefault(et, {"event_ticker": et, "series_ticker": ticker,
-                                        "title": m.get("title", ""), "markets": []})
+                                        "title": _series_cache["titles"].get(ticker)
+                                        or m.get("title", ""), "markets": []})
             ev["markets"].append(m)
         time.sleep(REQUEST_GAP)
     return list(events.values())

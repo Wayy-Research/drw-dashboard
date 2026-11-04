@@ -74,7 +74,7 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <script>
 let snap=null, tab="long";
 const $=id=>document.getElementById(id);
-const c=x=>x==null?"–":Math.round(x*100)+"¢";
+const c=x=>x==null?"–":(x<0.01?(x*100).toFixed(1):Math.round(x*100))+"¢";
 const pct=(x,d=0)=>x==null?"–":(x*100).toFixed(d)+"%";
 const esc=s=>String(s??"").replace(/[&<>"]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
 try{tab=localStorage.getItem("tab")||tab}catch(e){}
@@ -134,7 +134,8 @@ function render(){
       ${r.candidates.map(x=>`<tr><td>${esc(x.name)}${x.winner?" ✓":""}</td><td>${esc(x.party)}</td>
       <td class="n">${x.poll_share==null?"–":x.poll_share.toFixed(1)}</td><td class="n">${Math.round(x.votes).toLocaleString()}</td></tr>`).join("")}</table></div>`).join("")
       || `<div class="empty">No polls or results loaded. Set POLLS_SOURCE / RESULTS_SOURCE.</div>`;}
-  else if(tab==="unmatched"){ const u=snap.unmatched||[];
+  else if(tab==="unmatched"){ // tightest races first: the ones the market hasn't settled
+    const u=[...(snap.unmatched||[])].sort((a,b)=>Math.abs((a.yes_ask??1)-0.5)-Math.abs((b.yes_ask??1)-0.5));
     html=u.length?u.map(x=>`<div class="card"><div class="row"><span class="race">${esc(x.title)}</span><span>${c(x.yes_ask)}</span></div>
       <div class="sub">${esc(x.outcome)} · race: ${esc(x.race||"?")}</div><div class="why">${esc(x.ticker)} — ${esc(x.why)}</div></div>`).join("")
       :`<div class="empty">Every market is scored.</div>`;}

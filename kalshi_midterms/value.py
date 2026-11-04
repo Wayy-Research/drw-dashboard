@@ -18,6 +18,7 @@ class ScanParams:
     longshot_max: float = 0.25    # ask at or below this counts as a long shot
     max_spread: float = 0.10      # wider than this is flagged as illiquid
     min_volume: float = 100       # lifetime contracts traded
+    min_arb_profit: float = 0.005 # ignore bundles that clear by less than half a cent
 
 
 def taker_fee(price: float, contracts: int = 100, rate: float = 0.07) -> float:
@@ -126,13 +127,13 @@ def find_arbitrage(events: list[dict], params: ScanParams | None = None) -> list
                 "race": parse_race(ev, mks[0]) or "", "legs": legs}
         if all(q["yes_ask"] is not None for q in quotes):
             cost = sum(q["yes_ask"] + fee(q["yes_ask"]) for q in quotes)
-            if cost < 1:
+            if 1 - cost >= params.min_arb_profit:
                 out.append({**base, "kind": "YES bundle", "cost": round(cost, 4),
                             "payout": 1.0, "profit": round(1 - cost, 4)})
         if all(q["no_ask"] is not None for q in quotes):
             cost = sum(q["no_ask"] + fee(q["no_ask"]) for q in quotes)
             payout = len(quotes) - 1
-            if cost < payout:
+            if payout - cost >= params.min_arb_profit:
                 out.append({**base, "kind": "NO bundle", "cost": round(cost, 4),
                             "payout": float(payout), "profit": round(payout - cost, 4)})
     out.sort(key=lambda a: a["profit"], reverse=True)
