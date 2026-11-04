@@ -1,0 +1,24 @@
+# Render Blueprint for the Kalshi midterm value scanner (kalshi_midterms/).
+# Deploy: https://render.com/deploy?repo=https://github.com/Wayy-Research/drw-dashboard
+services:
+  - type: web
+    name: kalshi-midterms
+    runtime: python
+    plan: free
+    buildCommand: "echo 'stdlib only - nothing to install'"
+    startCommand: "python -m kalshi_midterms"
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: REFRESH_SECONDS
+        value: "60"
+      # CSV/JSON URL (e.g. a Google Sheet published as CSV) or a repo path
+      - key: POLLS_SOURCE
+        sync: false
+      # CSV/JSON URL, a repo path, or "ap" (then set AP_API_KEY)
+      - key: RESULTS_SOURCE
+        sync: false
+      - key: AP_API_KEY
+        sync: false
